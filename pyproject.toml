@@ -50,7 +50,8 @@ dependencies = [
     "cvxpy", 
     "cvxpylayers", 
     "casadi",
-    "torchsde"
+    "torchsde",
+    "gpytorch>=1.11,<2.0"
 ]
 
 [project.urls]
