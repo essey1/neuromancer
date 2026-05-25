@@ -980,29 +980,33 @@ def prepare_gpphs_data(
     u=None,
     split_ratio=None,
     batch_size=32,
-    num_workers=0,
 ):
     """
-    Prepare DataLoaders for GP-PHS pointwise (NLML) training.
+    Prepare StaticDatasets for GP-PHS pointwise (NLML) training.
 
     Assumes x_dot is already available — no smoother needed.
-    Each mini-batch is a random set of independent (x, x_dot, u) triples;
+    Each mini-batch is a random set of independent (x, x_dot[, u]) tuples;
     time ordering does NOT matter here (the GP loss is pointwise).
 
-    :param x:           (np.ndarray) State observations,       shape (T, nx) or (T,)
-    :param x_dot:       (np.ndarray) Derivative observations,  shape (T, nx) or (T,)
-    :param u:           (np.ndarray) Control inputs,           shape (T, nu) or (T,)
+    Compatible with LitDataModule as a data_setup_function:
+
+        dm = LitDataModule(prepare_gpphs_data, x=x, x_dot=x_dot, u=u, batch_size=32)
+
+    :param x:           (np.ndarray) State observations,      shape (T, nx) or (T,)
+    :param x_dot:       (np.ndarray) Derivative observations, shape (T, nx) or (T,)
+    :param u:           (np.ndarray) Control inputs,          shape (T, nu) or (T,)
                         Pass None if there is no control input.
     :param split_ratio: (list) [train_pct, dev_pct] out of 100.0, e.g. [60.0, 20.0].
-                        Default None splits data into equal thirds.
-    :param batch_size:  (int) Number of samples per mini-batch. Default 32.
-    :param num_workers: (int) DataLoader worker processes. Default 0 (main process).
+                        Default None splits into equal thirds.
+    :param batch_size:  (int) Samples per mini-batch. Default 32.
 
-    :return: (train_loader, dev_loader, test_loader), dims
+    :return: train_ds, dev_ds, test_ds, batch_size
     """
     # 1. Auto-promote 1D inputs to 2D
-    if x.ndim == 1:     x     = x.reshape(-1, 1)
-    if x_dot.ndim == 1: x_dot = x_dot.reshape(-1, 1)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if x_dot.ndim == 1:
+        x_dot = x_dot.reshape(-1, 1)
     if u is not None and u.ndim == 1:
         u = u.reshape(-1, 1)
 
@@ -1017,25 +1021,61 @@ def prepare_gpphs_data(
             f"u has {u.shape[0]} rows but x has {x.shape[0]}"
 
     # 3. Pack into dict (ensure float32)
-    data = {'X': x.astype(np.float32), 'Xdot': x_dot.astype(np.float32)}
+    data = {
+        'X':    x.astype(np.float32),
+        'Xdot': x_dot.astype(np.float32),
+    }
     if u is not None:
         data['U'] = u.astype(np.float32)
 
     # 4. Split
     train_data, dev_data, test_data = split_static_data(data, split_ratio)
 
-    # 5. Wrap in StaticDataset
+    # 5. Wrap in StaticDatasets — keys X, Xdot, U are the contract
+    #    that the downstream GP-PHS model expects in every batch
     train_ds = StaticDataset(train_data, name='train')
     dev_ds   = StaticDataset(dev_data,   name='dev')
     test_ds  = StaticDataset(test_data,  name='test')
 
-    # 6. Wrap in DataLoaders
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              collate_fn=train_ds.collate_fn, num_workers=num_workers)
-    dev_loader   = DataLoader(dev_ds,   batch_size=batch_size, shuffle=False,
-                              collate_fn=dev_ds.collate_fn,   num_workers=num_workers)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                              collate_fn=test_ds.collate_fn,  num_workers=num_workers)
+    return train_ds, dev_ds, test_ds, batch_size
+
+
+def get_gpphs_dataloaders(
+    x,
+    x_dot,
+    u=None,
+    split_ratio=None,
+    batch_size=32,
+    num_workers=0,
+):
+    """
+    Convenience wrapper around prepare_gpphs_data that builds and returns
+    DataLoaders directly. Use this when working outside of LitDataModule.
+
+    :param x:           (np.ndarray) State observations,      shape (T, nx) or (T,)
+    :param x_dot:       (np.ndarray) Derivative observations, shape (T, nx) or (T,)
+    :param u:           (np.ndarray) Control inputs,          shape (T, nu) or (T,)
+    :param split_ratio: (list) [train_pct, dev_pct] e.g. [60.0, 20.0]
+    :param batch_size:  (int) Samples per mini-batch.
+    :param num_workers: (int) DataLoader worker processes.
+
+    :return: (train_loader, dev_loader, test_loader), dims
+    """
+    train_ds, dev_ds, test_ds, batch_size = prepare_gpphs_data(
+        x, x_dot, u=u, split_ratio=split_ratio, batch_size=batch_size,
+    )
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True,
+        collate_fn=train_ds.collate_fn, num_workers=num_workers,
+    )
+    dev_loader = DataLoader(
+        dev_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=dev_ds.collate_fn, num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False,
+        collate_fn=test_ds.collate_fn, num_workers=num_workers,
+    )
 
     return (train_loader, dev_loader, test_loader), train_ds.dims
-
