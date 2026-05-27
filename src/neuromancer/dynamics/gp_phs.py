@@ -447,3 +447,237 @@ class GPPHSModel(gpytorch.models.ExactGP):
         covar = self.covar_module(x, x)         # (N·nx, N·nx)
 
         return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+
+# ---------------------------------------------------------------------------
+# Component 5 — GPPosterior
+# ---------------------------------------------------------------------------
+
+class GPPosterior(nn.Module):
+    """
+    GP posterior for Port-Hamiltonian dynamics.
+
+    Forms the joint distribution over [Ẋ, H(x*)] from equation (14):
+
+        [Ẋ       ]       [K_phs            k_ẋH(X, x*)  ]
+        [H(x*)]  ~ N(0,  [k_ẋH(X,x*)ᵀ     k_HH(x*, x*) ])
+
+    Conditions on training Ẋ to obtain posterior over H(x*):
+
+        μ_H = k_ẋH(X,x*)ᵀ · (K_phs + Δ)⁻¹ · Ẋ
+        Σ_H = k_HH(x*,x*) - k_ẋH(X,x*)ᵀ · (K_phs + Δ)⁻¹ · k_ẋH(X,x*)
+
+    Samples from this posterior are then passed to
+    HamiltonianApproximator to get a callable H*(x).
+
+    Args:
+        model        : trained GPPHSModel
+        likelihood   : trained GaussianLikelihood
+        phs_matrices : trained PHSMatrices — carries learned J, R, G
+        lengthscale  : (nx,)  learned Λ diagonal
+        signal_var   : ()     learned σ_f
+        noise_var    : ()     learned noise variance
+
+    Usage:
+        learned  = problem.train(train_x, train_u, train_xdot)
+        posterior = GPPosterior(**learned)
+
+        # get posterior over H at test points
+        H_mean, H_var, H_samples = posterior(train_x, train_xdot, test_x)
+    """
+
+    def __init__(
+        self,
+        model,
+        likelihood,
+        phs_matrices,
+        lengthscale:  torch.Tensor,
+        signal_var:   torch.Tensor,
+        noise_var:    torch.Tensor,
+    ):
+        super().__init__()
+        self.model        = model
+        self.likelihood   = likelihood
+        self.phs          = phs_matrices
+
+        self.register_buffer("lengthscale", lengthscale)   # (nx,)
+        self.register_buffer("signal_var",  signal_var)    # scalar
+        self.register_buffer("noise_var",   noise_var)     # scalar
+
+        # enforce eval mode — no gradients needed
+        self.model.eval()
+        self.likelihood.eval()
+
+    # ── kernel helpers ─────────────────────────────────────────────────────
+
+    def _k_HH(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Scalar RBF kernel between H values.
+
+            k_HH(x, x') = σ²f · exp(-||x-x'||²_Λ)
+
+        Args:
+            x1 : (N, nx)
+            x2 : (M, nx)
+
+        Returns:
+            (N, M)
+        """
+        inv_lambda = 1.0 / self.lengthscale              # (nx,)
+        delta      = (x1[:, None, :] - x2[None, :, :])  # (N, M, nx)
+        sq_dist    = ((delta * inv_lambda) ** 2).sum(-1) # (N, M)
+        return self.signal_var * torch.exp(-sq_dist)     # (N, M)
+
+    def _k_xdotH(
+        self,
+        x_train: torch.Tensor,
+        x_test:  torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Cross-kernel between ẋ at training points and H at test points.
+
+            k_ẋH(x, x') = (J(x)-R(x)) · ∇_x k_HH(x, x')
+
+        where:
+            ∇_x k_HH(x,x') = k_HH(x,x') · (-Λ⁻¹(x-x'))
+
+        so:
+            k_ẋH(x,x') = σ²f · (J-R)(x) · (-Λ⁻¹(x-x')) · exp(-||x-x'||²_Λ)
+
+        Args:
+            x_train : (N, nx)  training states
+            x_test  : (M, nx)  test states
+
+        Returns:
+            (N·nx, M)  — one nx-vector per training point per test point
+        """
+        N  = x_train.shape[0]
+        M  = x_test.shape[0]
+        nx = self.phs.nx
+
+        inv_lambda = 1.0 / self.lengthscale                        # (nx,)
+
+        # scalar k_HH values : (N, M)
+        k_hh = self._k_HH(x_train, x_test)
+
+        # weighted difference : (N, M, nx)
+        delta = (x_train[:, None, :] - x_test[None, :, :])        # (N, M, nx)
+
+        # ∇_x k_HH : (N, M, nx)  — gradient of k_HH w.r.t. x_train
+        grad_k = -k_hh[:, :, None] * delta * (inv_lambda ** 2)    # (N, M, nx)
+
+        # (J-R) at training points : (N, nx, nx)
+        JR = self.phs.get_J(x_train) - self.phs.get_R(x_train)
+
+        # k_ẋH[n, m] = JR[n] @ grad_k[n, m]  : (N, M, nx)
+        # JR       : (N, 1, nx, nx)
+        # grad_k   : (N, M, nx, 1)
+        k_xdotH = (JR[:, None, :, :] @
+                   grad_k[:, :, :, None]).squeeze(-1)              # (N, M, nx)
+
+        # reshape to (N·nx, M)
+        return k_xdotH.permute(0, 2, 1).reshape(N * nx, M)
+
+    # ── posterior over H ───────────────────────────────────────────────────
+
+    def _get_K_phs_plus_noise(
+        self,
+        x_train: torch.Tensor,
+        u_train: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get the training kernel matrix (K_phs + Δ) from the trained model.
+        GPyTorch has already computed and cached this via the Cholesky.
+
+        Returns:
+            (N·nx, N·nx)
+        """
+        with torch.no_grad():
+            # get the lazy covariance from the trained model
+            train_dist = self.model(x_train, u_train)
+            K = train_dist.lazy_covariance_matrix
+
+            # add noise (Δ) — GaussianLikelihood adds noise_var * I
+            noise = self.noise_var * torch.eye(
+                K.shape[-1], dtype=x_train.dtype, device=x_train.device
+            )
+            return K.to_dense() + noise                            # (N·nx, N·nx)
+
+    def forward(
+        self,
+        train_x:    torch.Tensor,
+        train_u:    torch.Tensor,
+        train_xdot: torch.Tensor,
+        test_x:     torch.Tensor,
+        n_samples:  int = 10,
+    ):
+        """
+        Compute posterior over H(x*) conditioned on training Ẋ.
+
+        Args:
+            train_x    : (N, nx)   training states
+            train_u    : (N, nu)   training control inputs
+            train_xdot : (N, nx)   training state derivatives
+            test_x     : (M, nx)   test states to sample H at
+            n_samples  : number of H samples to draw
+
+        Returns:
+            H_mean    : (M,)         posterior mean of H at test points
+            H_var     : (M,)         posterior variance of H at test points
+            H_samples : (n_samples, M)  samples from posterior over H
+        """
+        N  = train_x.shape[0]
+        M  = test_x.shape[0]
+        nx = self.phs.nx
+
+        with torch.no_grad():
+
+            # ── build cross and self kernels ───────────────────────────────
+            # k_ẋH(X, x*) : (N·nx, M)
+            K_xdotH = self._k_xdotH(train_x, test_x)
+
+            # k_HH(x*, x*) : (M, M)
+            K_HH = self._k_HH(test_x, test_x)
+
+            # (K_phs + Δ) : (N·nx, N·nx)
+            K_noise = self._get_K_phs_plus_noise(train_x, train_u)
+
+            # ── solve (K_phs + Δ)⁻¹ · k_ẋH via Cholesky ──────────────────
+            # more numerically stable than explicit inverse
+            L = torch.linalg.cholesky(K_noise)                    # (N·nx, N·nx)
+
+            # flatten training xdot to (N·nx,)
+            xdot_flat = train_xdot.reshape(-1)                    # (N·nx,)
+
+            # α = (K_phs + Δ)⁻¹ · Ẋ : (N·nx,)
+            alpha = torch.cholesky_solve(
+                xdot_flat.unsqueeze(-1), L
+            ).squeeze(-1)                                          # (N·nx,)
+
+            # V = (K_phs + Δ)⁻¹ · k_ẋH : (N·nx, M)
+            V = torch.cholesky_solve(K_xdotH, L)                  # (N·nx, M)
+
+            # ── posterior mean and covariance ──────────────────────────────
+            # μ_H = k_ẋH(X,x*)ᵀ · α : (M,)
+            H_mean = K_xdotH.T @ alpha                             # (M,)
+
+            # Σ_H = k_HH - k_ẋH(X,x*)ᵀ · V : (M, M)
+            H_cov  = K_HH - K_xdotH.T @ V                         # (M, M)
+
+            # clamp diagonal for numerical stability
+            H_var  = H_cov.diagonal().clamp(min=0.0)               # (M,)
+
+            # ── sample from posterior ──────────────────────────────────────
+            # H ~ N(μ_H, Σ_H)
+            # add jitter to Σ_H for Cholesky stability
+            jitter  = 1e-6 * torch.eye(M, dtype=test_x.dtype, device=test_x.device)
+            L_H     = torch.linalg.cholesky(H_cov + jitter)        # (M, M)
+            eps     = torch.randn(n_samples, M,
+                                  dtype=test_x.dtype, device=test_x.device)
+            H_samples = H_mean[None, :] + (eps @ L_H.T)            # (n_samples, M)
+
+        return H_mean, H_var, H_samples
