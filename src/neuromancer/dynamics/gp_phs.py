@@ -3,6 +3,8 @@ gp_phs.py
 =========
 Component 1 — PHSMatrices : structural definition of J, R, G
 Component 2 — PHSKernel   : physics-structured GP covariance
+Component 3 — PHSMeanFunction : GP prior mean m(x, u) = G(x) · u
+Component 4 — GPPHSModel      : full GP model combining mean + kernel
 
 Port-Hamiltonian System:
     ẋ = (J(x) - R(x)) · ∇H  +  G(x) · u
@@ -325,3 +327,123 @@ class PHSKernel(Kernel):
         K_out = K_phs.permute(0, 2, 1, 3).reshape(N * self.nx, M * self.nx)
 
         return DenseLinearOperator(K_out)
+
+# ---------------------------------------------------------------------------
+# Component 3 — PHSMeanFunction
+# ---------------------------------------------------------------------------
+
+class PHSMeanFunction(gpytorch.means.Mean):
+    """
+    Prior mean function for the PHS GP model.
+
+    Computes m(x, u) = G(x) · u for each data point.
+
+    This class expects x and u to be passed separately — concatenation
+    and splitting is handled by GPPHSModel.forward, not here.
+
+    Args:
+        phs_matrices : PHSMatrices instance — provides get_G(x)
+        nx           : state dimension
+        nu           : input dimension
+
+    Input:
+        x : (N, nx)
+        u : (N, nu)
+
+    Output:
+        (N·nx,) — flattened mean vector
+    """
+
+    def __init__(self, phs_matrices, nx, nu):
+        super().__init__()
+        self.phs = phs_matrices
+        self.nx  = nx
+        self.nu  = nu
+
+    def forward(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        # G(x) : (N, nx, nu)
+        G = self.phs.get_G(x)
+
+        # batched matrix-vector product: G(xₙ) · uₙ for each n
+        # u.unsqueeze(-1) : (N, nu, 1)
+        # G @ u           : (N, nx, 1) → squeeze → (N, nx)
+        mean = (G @ u.unsqueeze(-1)).squeeze(-1)    # (N, nx)
+
+        # flatten to (N·nx,) to match the (N·nx, M·nx) kernel output
+        return mean.reshape(-1)
+
+
+# ---------------------------------------------------------------------------
+# Component 4 — GPPHSModel
+# ---------------------------------------------------------------------------
+
+class GPPHSModel(gpytorch.models.ExactGP):
+    """
+    Full GP model for Port-Hamiltonian dynamics.
+
+    GP prior:
+        ẋ ~ GP(G(x)u, k_phs(x, x'))
+
+    x and u are always passed separately — concatenation never happens.
+    The kernel receives x only (k_phs is a function of x alone).
+    The mean receives x and u separately (m = G(x)·u needs both).
+
+    Args:
+        train_x    : (N, nx)  — training state trajectories
+        train_u    : (N, nu)  — training control inputs
+        train_xdot : (N·nx,) — training state derivatives, flattened
+        likelihood : gpytorch.likelihoods.Likelihood instance
+        phs_matrices : PHSMatrices instance
+        nx           : state dimension
+        nu           : input dimension
+
+    Usage:
+        model = GPPHSModel(train_x, train_u, train_xdot,
+                           likelihood, phs_matrices, nx, nu)
+
+        # training
+        pred = model(train_x, train_u)
+
+        # new points
+        pred = model(test_x, test_u)
+    """
+
+    def __init__(
+        self,
+        train_x:    torch.Tensor,
+        train_u:    torch.Tensor,
+        train_xdot: torch.Tensor,
+        likelihood,
+        phs_matrices,
+        nx: int,
+        nu: int,
+    ):
+        # GPyTorch internals need a single training input tensor
+        # we concatenate here once, only for the parent class
+        train_xu = torch.cat([train_x, train_u], dim=-1)
+        super().__init__(train_xu, train_xdot, likelihood)
+
+        self.nx = nx
+        self.nu = nu
+
+        self.mean_module  = PHSMeanFunction(phs_matrices, nx, nu)
+        self.covar_module = PHSKernel(phs_matrices, nx)
+
+    def forward(self, x: torch.Tensor, u: torch.Tensor):
+        """
+        Args:
+            x : (N, nx) — state
+            u : (N, nu) — control input
+
+        Returns:
+            MultivariateNormal with
+                mean  : (N·nx,)
+                covar : (N·nx, N·nx)
+        """
+        # mean needs both x and u : m = G(x)·u
+        mean  = self.mean_module(x, u)          # (N·nx,)
+
+        # kernel needs x only : k_phs(x, x')
+        covar = self.covar_module(x, x)         # (N·nx, N·nx)
+
+        return gpytorch.distributions.MultivariateNormal(mean, covar)
