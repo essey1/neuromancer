@@ -461,6 +461,253 @@ class CSTR_Param(ODESystem):
         return torch.cat([dCadt, dTdt], dim=-1)
 
 
+class PHSODE(ODESystem):
+    """
+    Port-Hamiltonian System ODE for trajectory generation.
+
+    Implements:
+        ẋ = (J(x) - R(x)) · ∇H*(x) + G(x) · u
+
+    where:
+        J(x), R(x), G(x) — learned PHS matrices from PHSMatrices
+        ∇H*(x)           — gradient of approximated Hamiltonian
+                           from HamiltonianApproximator
+        u                — control input (constant, time-varying, or feedback)
+
+    Uncertainty is propagated by running one trajectory per H* sample
+    from the posterior ensemble, giving a distribution over trajectories.
+
+    Args:
+        phs_matrices : trained PHSMatrices — provides J(x), R(x), G(x)
+        hamiltonian  : fitted HamiltonianApproximator or list of them
+                       (list → ensemble mode, one per posterior H* sample)
+        nx           : state dimension
+        nu           : input dimension
+        method       : torchdiffeq solver ('dopri5', 'rk4', 'euler')
+                       default 'dopri5' (adaptive Runge-Kutta 4/5)
+
+    Usage:
+        # single H* — no uncertainty
+        ode = PHSODE(phs_matrices, hamiltonian, nx, nu)
+
+        # ensemble of H* — propagates uncertainty
+        ode = PHSODE(phs_matrices, hamiltonians, nx, nu)
+
+        # constant u
+        traj = ode.simulate(x0, t_span, u=u_const)
+
+        # time-varying u
+        traj = ode.simulate(x0, t_span, u=u_sequence, t_eval=t_eval)
+
+        # feedback u
+        traj = ode.simulate(x0, t_span, u=lambda x, t: controller(x))
+    """
+
+    def __init__(
+        self,
+        phs_matrices,
+        hamiltonian,
+        nx:     int,
+        nu:     int,
+        method: str = 'dopri5',
+    ):
+        super().__init__(insize=nx + nu, outsize=nx)
+        self.phs    = phs_matrices
+        self.method = method
+        self.nx     = nx
+        self.nu     = nu
+
+        # support single approximator or ensemble list
+        if isinstance(hamiltonian, (list, tuple)):
+            self.hamiltonians = hamiltonian
+        else:
+            self.hamiltonians = [hamiltonian]
+
+    def ode_equations(
+        self,
+        x:   torch.Tensor,
+        u:   torch.Tensor,
+        ham,                       # which HamiltonianApproximator to use
+    ) -> torch.Tensor:
+        """
+        Compute ẋ = (J(x)-R(x)) · ∇H*(x) + G(x) · u
+
+        Args:
+            x   : (batch, nx)
+            u   : (batch, nu)
+            ham : HamiltonianApproximator instance
+
+        Returns:
+            ẋ : (batch, nx)
+        """
+        # (J(x) - R(x)) : (batch, nx, nx)
+        JR = self.phs.get_J(x) - self.phs.get_R(x)
+
+        # ∇H*(x) : (batch, nx)
+        grad_H = ham.gradient(x)
+
+        # G(x) : (batch, nx, nu)
+        G = self.phs.get_G(x)
+
+        # (J-R) · ∇H* : (batch, nx)
+        f = (JR @ grad_H.unsqueeze(-1)).squeeze(-1)
+
+        # G(x) · u : (batch, nx)
+        g = (G @ u.unsqueeze(-1)).squeeze(-1)
+
+        return f + g                                   # (batch, nx)
+
+    def _resolve_u(
+        self,
+        u,
+        x:   torch.Tensor,
+        t:   torch.Tensor,
+        t_eval: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Resolve control input u at current state x and time t.
+
+        Supports three modes:
+            constant     : u is (batch, nu) tensor — same at every step
+            time-varying : u is (T, batch, nu) tensor — indexed by time step
+            feedback     : u is callable(x, t) -> (batch, nu)
+
+        Args:
+            u      : tensor (batch, nu) | tensor (T, batch, nu) | callable
+            x      : (batch, nx) current state
+            t      : () current time
+            t_eval : (T,) time points for time-varying indexing
+
+        Returns:
+            u_t : (batch, nu)
+        """
+        if callable(u):
+            # feedback: u(x, t) -> (batch, nu)
+            return u(x, t)
+
+        elif u.dim() == 2:
+            # constant: (batch, nu) — same at every step
+            return u
+
+        elif u.dim() == 3:
+            # time-varying: (T, batch, nu) — find closest time index
+            idx = torch.argmin(torch.abs(t_eval - t))
+            return u[idx]
+
+        else:
+            raise ValueError(
+                f"u must be (batch, nu), (T, batch, nu), or callable. Got shape {u.shape}"
+            )
+
+    def _simulate_single(
+        self,
+        x0:     torch.Tensor,
+        t_eval: torch.Tensor,
+        u,
+        ham,
+    ) -> torch.Tensor:
+        """
+        Simulate one trajectory using one HamiltonianApproximator.
+
+        Args:
+            x0     : (batch, nx)  initial state
+            t_eval : (T,)         time points to evaluate at
+            u      : control input — constant, time-varying, or callable
+            ham    : HamiltonianApproximator instance
+
+        Returns:
+            trajectory : (T, batch, nx)
+        """
+        from torchdiffeq import odeint
+
+        def rhs(t, x):
+            u_t = self._resolve_u(u, x, t, t_eval)
+            return self.ode_equations(x, u_t, ham)
+
+        trajectory = odeint(
+            rhs,
+            x0,
+            t_eval,
+            method=self.method,
+        )                                              # (T, batch, nx)
+
+        return trajectory
+
+    def simulate(
+        self,
+        x0:     torch.Tensor,
+        t_span: tuple,
+        u,
+        dt:     float = 0.01,
+        t_eval: torch.Tensor = None,
+    ) -> dict:
+        """
+        Simulate PHS trajectories over a time horizon.
+
+        For ensemble mode (multiple H* samples), runs one trajectory
+        per sample and returns the full distribution over trajectories.
+
+        Args:
+            x0     : (batch, nx)       initial state
+            t_span : (t0, tf)          start and end time
+            u      : control input, one of:
+                         (batch, nu)         — constant over trajectory
+                         (T, batch, nu)      — time-varying, one per t_eval step
+                         callable(x, t)      — feedback, called at each step
+            dt     : float             time step (used if t_eval not given)
+            t_eval : (T,) optional     specific times to evaluate at
+
+        Returns:
+            dict with:
+                'mean'      : (T, batch, nx)  mean trajectory over ensemble
+                'std'       : (T, batch, nx)  std over ensemble (0 if single H*)
+                'samples'   : (S, T, batch, nx)  all trajectories, S = n_samples
+                't_eval'    : (T,)            time points
+        """
+        t0, tf = t_span
+
+        if t_eval is None:
+            t_eval = torch.arange(
+                t0, tf + dt, dt,
+                dtype=x0.dtype, device=x0.device
+            )
+
+        # simulate one trajectory per H* sample
+        all_trajs = []
+        for ham in self.hamiltonians:
+            traj = self._simulate_single(x0, t_eval, u, ham)  # (T, batch, nx)
+            all_trajs.append(traj)
+
+        # stack over ensemble dimension : (S, T, batch, nx)
+        samples = torch.stack(all_trajs, dim=0)
+
+        # mean and std over ensemble
+        mean = samples.mean(dim=0)                             # (T, batch, nx)
+        std  = samples.std(dim=0)                              # (T, batch, nx)
+
+        return {
+            'mean':   mean,
+            'std':    std,
+            'samples': samples,
+            't_eval': t_eval,
+        }
+
+    def forward(self, x, u):
+        """
+        Single step evaluation — consistent with ODESystem interface.
+        Uses the first (or only) HamiltonianApproximator.
+
+        Args:
+            x : (batch, nx)
+            u : (batch, nu)
+
+        Returns:
+            ẋ : (batch, nx)
+        """
+        assert len(x.shape) == 2
+        return self.ode_equations(x, u, self.hamiltonians[0])
+
+
 
 ode_param_systems_auto = {'LorenzParam': LorenzParam,
                           'LotkaVolterraParam': LotkaVolterraParam,
@@ -477,7 +724,10 @@ ode_hybrid_systems_auto = {'LotkaVolterraHybrid': LotkaVolterraHybrid,
 
 ode_networked_systems = {'GeneralNetworkedODE': GeneralNetworkedODE}
 
+ode_phs_systems = {'PHSODE': PHSODE}
+
 odes = {**ode_param_systems_auto,
         **ode_param_systems_nonauto,
         **ode_hybrid_systems_auto,
-        **ode_networked_systems}
+        **ode_networked_systems,
+        **ode_phs_systems}
