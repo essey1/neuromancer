@@ -21,6 +21,8 @@ import torch.nn.functional as F
 
 from neuromancer.constraint import Constraint
 
+import gpytorch
+
 
 class AggregateLoss(nn.Module, ABC):
     """
@@ -342,12 +344,64 @@ class AugmentedLagrangeLoss(AggregateLoss):
             input_dict['loss'] += scaled_penalty_loss
 
         return input_dict
+    
+# ──────────────────────────────────────────────────────────────────────────
+# GP-PHS Loss  (does not subclass AggregateLoss — different paradigm)
+# ──────────────────────────────────────────────────────────────────────────
+
+class GPPHSLoss(nn.Module):
+    """
+    NLML loss for the GP-PHS model.
+
+    Wraps gpytorch.mlls.ExactMarginalLogLikelihood.
+    Does not subclass AggregateLoss — the GP marginal likelihood
+    is a fundamentally different loss from the penalty/barrier/
+    augmented Lagrange losses in this file.
+
+    Args:
+        model      : GPPHSModel instance
+        likelihood : gpytorch.likelihoods.GaussianLikelihood instance
+
+    Usage:
+        loss_fn = GPPHSLoss(model, likelihood)
+        loss = loss_fn(x, u, xdot)
+        loss.backward()
+    """
+
+    def __init__(self, model, likelihood):
+        super().__init__()
+        self.model      = model
+        self.likelihood = likelihood
+        self.mll        = gpytorch.mlls.ExactMarginalLogLikelihood(
+                              likelihood, model
+                          )
+
+    def forward(
+        self,
+        x:    torch.Tensor,
+        u:    torch.Tensor,
+        xdot: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute negative NLML loss.
+
+        Args:
+            x    : (N, nx)  state
+            u    : (N, nu)  control input
+            xdot : (N, nx)  state derivatives
+
+        Returns:
+            scalar loss — minimizing this maximizes the marginal likelihood
+        """
+        output = self.model(x, u)
+        return -self.mll(output, xdot.reshape(-1))
 
 
 losses = {'penalty': PenaltyLoss,
           'barrier': BarrierLoss,
-          'augmented_lagrange': AugmentedLagrangeLoss}
-
+          'augmented_lagrange': AugmentedLagrangeLoss,
+          'gp_phs': GPPHSLoss,
+        }
 
 def get_loss(objectives, constraints, train_data, args):
     if args.loss == 'penalty':
@@ -360,3 +414,6 @@ def get_loss(objectives, constraints, train_data, args):
                           'mu_init': args.mu_init, "mu_max": args.mu_max}
         loss = AugmentedLagrangeLoss(objectives, constraints, train_data, **optimizer_args)
     return loss
+
+def get_gpphs_loss(model, likelihood):
+    return GPPHSLoss(model, likelihood)
