@@ -429,14 +429,24 @@ class GPPHSProblem(nn.Module):
         train_x:    torch.Tensor,
         train_u:    torch.Tensor,
         train_xdot: torch.Tensor,
+        xdot_var:   torch.Tensor = None,
     ):
+        """
+        Args:
+            train_x    : (N, nx)
+            train_u    : (N, nu)
+            train_xdot : (N, nx) or (N·nx,)
+            xdot_var   : (N, nx) derivative variances from gp_smoother (optional).
+                         If provided, replaces likelihood.noise * I with diag(xdot_var)
+                         in the NLML — uses the paper's true Δ matrix.
+        """
         self.model.train()
         self.likelihood.train()
 
         nlml_history = []
         for epoch in range(self.n_epochs):
             self.optimizer.zero_grad()
-            loss = self.loss_fn(train_x, train_u, train_xdot)
+            loss = self.loss_fn(train_x, train_u, train_xdot, xdot_var)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self._params, max_norm=1.0)
             self.optimizer.step()

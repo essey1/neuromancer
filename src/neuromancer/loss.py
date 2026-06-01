@@ -379,17 +379,20 @@ class GPPHSLoss(nn.Module):
 
     def forward(
         self,
-        x:    torch.Tensor,
-        u:    torch.Tensor,
-        xdot: torch.Tensor,
+        x:        torch.Tensor,
+        u:        torch.Tensor,
+        xdot:     torch.Tensor,
+        xdot_var: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Compute negative NLML loss.
 
         Args:
-            x    : (N, nx)  state
-            u    : (N, nu)  control input
-            xdot : (N·nx,) or (N, nx)  state derivatives
+            x        : (N, nx)   state
+            u        : (N, nu)   control input
+            xdot     : (N·nx,) or (N, nx)  state derivatives
+            xdot_var : (N, nx)   derivative variances from gp_smoother (Δ diagonal).
+                       If None, falls back to likelihood.noise * I.
 
         Returns:
             scalar loss — minimizing this maximizes the marginal likelihood
@@ -400,9 +403,12 @@ class GPPHSLoss(nn.Module):
         mean  = dist.mean                       # (N·nx,)
         K     = dist.lazy_covariance_matrix.to_dense()  # (N·nx, N·nx)
 
-        n     = K.shape[0]
-        noise = self.likelihood.noise           # scalar, always positive
-        K_noisy = K + noise * torch.eye(n, dtype=K.dtype, device=K.device)
+        n = K.shape[0]
+        if xdot_var is not None:
+            Delta = torch.diag(xdot_var.reshape(-1).to(dtype=K.dtype, device=K.device))
+        else:
+            Delta = self.likelihood.noise * torch.eye(n, dtype=K.dtype, device=K.device)
+        K_noisy = K + Delta
 
         residual = y - mean                     # (N·nx,)
 

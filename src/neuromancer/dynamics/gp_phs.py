@@ -585,26 +585,31 @@ class GPPosterior(nn.Module):
 
     def _get_K_phs_plus_noise(
         self,
-        x_train: torch.Tensor,
-        u_train: torch.Tensor,
+        x_train:  torch.Tensor,
+        u_train:  torch.Tensor,
+        xdot_var: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        Get the training kernel matrix (K_phs + Δ) from the trained model.
-        GPyTorch has already computed and cached this via the Cholesky.
+        Returns K_phs + Δ  of shape (N·nx, N·nx).
 
-        Returns:
-            (N·nx, N·nx)
+        Δ is the derivative noise matrix:
+            - If xdot_var (N, nx) is given: Δ = diag(xdot_var.flatten())
+              — uses per-point variances from the GP smoother (paper-correct).
+            - Otherwise: Δ = noise_var * I  (scalar fallback).
         """
         with torch.no_grad():
-            # get the lazy covariance from the trained model
             train_dist = self.model(x_train, u_train)
-            K = train_dist.lazy_covariance_matrix
+            K = train_dist.lazy_covariance_matrix.to_dense()
 
-            # add noise (Δ) — GaussianLikelihood adds noise_var * I
-            noise = self.noise_var * torch.eye(
-                K.shape[-1], dtype=x_train.dtype, device=x_train.device
-            )
-            return K.to_dense() + noise                            # (N·nx, N·nx)
+            if xdot_var is not None:
+                Delta = torch.diag(
+                    xdot_var.reshape(-1).to(dtype=K.dtype, device=K.device)
+                )
+            else:
+                Delta = self.noise_var * torch.eye(
+                    K.shape[-1], dtype=K.dtype, device=K.device
+                )
+            return K + Delta                                        # (N·nx, N·nx)
 
     def forward(
         self,
@@ -613,6 +618,7 @@ class GPPosterior(nn.Module):
         train_xdot: torch.Tensor,
         test_x:     torch.Tensor,
         n_samples:  int = 10,
+        xdot_var:   torch.Tensor = None,
     ):
         """
         Compute posterior over H(x*) conditioned on training Ẋ.
@@ -643,7 +649,7 @@ class GPPosterior(nn.Module):
             K_HH = self._k_HH(test_x, test_x)
 
             # (K_phs + Δ) : (N·nx, N·nx)
-            K_noise = self._get_K_phs_plus_noise(train_x, train_u)
+            K_noise = self._get_K_phs_plus_noise(train_x, train_u, xdot_var)
 
             # ── solve (K_phs + Δ)⁻¹ · k_ẋH via Cholesky ──────────────────
             n_k = K_noise.shape[0]
