@@ -978,13 +978,18 @@ def prepare_gpphs_data(
     x,
     x_dot,
     u=None,
+    x_dot_var=None,
     split_ratio=None,
     batch_size=32,
 ):
     """
     Prepare StaticDatasets for GP-PHS pointwise (NLML) training.
 
-    Assumes x_dot is already available — no smoother needed.
+    Assumes x_dot is already available — either measured directly or
+    estimated via gp_smoother.gp_smooth(), which also returns x_dot_var.
+    Pass x_dot_var to include per-point derivative variances (Δ diagonal)
+    so GPPHSLoss and GPPosterior can use the paper-correct noise matrix.
+
     Each mini-batch is a random set of independent (x, x_dot[, u]) tuples;
     time ordering does NOT matter here (the GP loss is pointwise).
 
@@ -1027,6 +1032,12 @@ def prepare_gpphs_data(
     }
     if u is not None:
         data['U'] = u.astype(np.float32)
+    if x_dot_var is not None:
+        if x_dot_var.ndim == 1:
+            x_dot_var = x_dot_var.reshape(-1, 1)
+        assert x_dot_var.shape == x_dot.shape, \
+            f"x_dot_var shape {x_dot_var.shape} must match x_dot shape {x_dot.shape}"
+        data['Xdot_var'] = x_dot_var.astype(np.float32)
 
     # 4. Split
     train_data, dev_data, test_data = split_static_data(data, split_ratio)
