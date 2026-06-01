@@ -21,7 +21,6 @@ import torch.nn.functional as F
 
 from neuromancer.constraint import Constraint
 
-import gpytorch
 
 
 class AggregateLoss(nn.Module, ABC):
@@ -353,10 +352,15 @@ class GPPHSLoss(nn.Module):
     """
     NLML loss for the GP-PHS model.
 
-    Wraps gpytorch.mlls.ExactMarginalLogLikelihood.
-    Does not subclass AggregateLoss — the GP marginal likelihood
-    is a fundamentally different loss from the penalty/barrier/
-    augmented Lagrange losses in this file.
+    Computes the negative marginal log-likelihood directly via Cholesky:
+
+        NLML = 0.5 · rᵀ(K+σ²I)⁻¹r + 0.5 · log|K+σ²I| + const
+
+    where r = ẋ_flat - μ(x,u) is the residual over all N·nx observations.
+
+    GPyTorch's ExactMarginalLogLikelihood cannot be used here because
+    ExactGP assumes N inputs → N scalar outputs, but PHS has N inputs →
+    N·nx outputs (the noise would be (N,N) vs the kernel (N·nx, N·nx)).
 
     Args:
         model      : GPPHSModel instance
@@ -372,9 +376,6 @@ class GPPHSLoss(nn.Module):
         super().__init__()
         self.model      = model
         self.likelihood = likelihood
-        self.mll        = gpytorch.mlls.ExactMarginalLogLikelihood(
-                              likelihood, model
-                          )
 
     def forward(
         self,
@@ -388,13 +389,35 @@ class GPPHSLoss(nn.Module):
         Args:
             x    : (N, nx)  state
             u    : (N, nu)  control input
-            xdot : (N, nx)  state derivatives
+            xdot : (N·nx,) or (N, nx)  state derivatives
 
         Returns:
             scalar loss — minimizing this maximizes the marginal likelihood
         """
-        output = self.model(x, u)
-        return -self.mll(output, xdot.reshape(-1))
+        y = xdot.reshape(-1)                    # (N·nx,)
+
+        dist  = self.model(x, u)
+        mean  = dist.mean                       # (N·nx,)
+        K     = dist.lazy_covariance_matrix.to_dense()  # (N·nx, N·nx)
+
+        n     = K.shape[0]
+        noise = self.likelihood.noise           # scalar, always positive
+        K_noisy = K + noise * torch.eye(n, dtype=K.dtype, device=K.device)
+
+        residual = y - mean                     # (N·nx,)
+
+        log2pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=K.dtype, device=K.device))
+
+        # Small fixed jitter for floating-point stability. The PHS kernel is
+        # PSD by construction (correct mixed Hessian formula), so 1e-6 is enough.
+        jitter  = 1e-6 * torch.eye(n, dtype=K.dtype, device=K.device)
+        L       = torch.linalg.cholesky(K_noisy + jitter)
+        alpha   = torch.cholesky_solve(residual.unsqueeze(-1), L).squeeze(-1)
+
+        nlml = (0.5 * (residual @ alpha)
+                + L.diagonal().log().sum()
+                + 0.5 * n * log2pi)
+        return nlml
 
 
 losses = {'penalty': PenaltyLoss,

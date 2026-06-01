@@ -105,6 +105,7 @@ class HamiltonianApproximator(nn.Module):
         # pre-solve weights for the differentiable torch version
         # so gradient() doesn't need to solve lstsq at every call
         self._weights = self._solve_weights(self._x_fit, self._H_fit)
+        return self
 
     def _basis(self, r2: torch.Tensor) -> torch.Tensor:
         """
@@ -215,3 +216,74 @@ class HamiltonianApproximator(nn.Module):
             H.sum(), x_req, create_graph=False
         )[0]                                          # (K, nx)
         return grad
+
+
+class GPHamiltonianApproximator(nn.Module):
+    """
+    GP posterior mean as H* approximator.
+
+    Fits H*(x) = k(x, X) @ K⁻¹ @ H_vals using the SE kernel.
+    Gradient ∇H*(x) is computed analytically — no autograd, no noisy weights.
+
+    Reuses the lengthscale learned by GPPHSProblem so the smoothing is
+    physically calibrated to the system dynamics.
+
+    Args:
+        lengthscale : (nx,)  from learned['lengthscale']
+        signal_var  : scalar from learned['signal_var']
+        noise       : nugget added to the diagonal for numerical stability
+
+    Usage:
+        approx = GPHamiltonianApproximator(
+                     lengthscale=learned['lengthscale'],
+                     signal_var=learned['signal_var'],
+                 ).fit(x_fit, H_sample)
+
+        H_star   = approx(x)           # (K,)
+        grad_H   = approx.gradient(x)  # (K, nx)
+    """
+
+    def __init__(
+        self,
+        lengthscale: torch.Tensor,
+        signal_var:  torch.Tensor,
+        noise:       float = 1e-4,
+    ):
+        super().__init__()
+        self.register_buffer('lengthscale', lengthscale.detach().squeeze())
+        self.register_buffer('signal_var',  signal_var.detach().squeeze())
+        self.noise   = noise
+        self._x_fit  = None
+        self._alpha  = None   # (K⁻¹ @ H_vals) — solved once in fit()
+
+    def _k(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """SE kernel  k(x1, x2) = σ²f · exp(-0.5 · ||x1-x2||²_Λ)  →  (N, M)"""
+        inv_l = 1.0 / self.lengthscale
+        delta  = (x1[:, None, :] - x2[None, :, :]) * inv_l   # (N, M, nx)
+        return self.signal_var * torch.exp(-0.5 * (delta ** 2).sum(-1))
+
+    def fit(self, x: torch.Tensor, H_vals: torch.Tensor):
+        """Solve α = (K + noise·I)⁻¹ H_vals via Cholesky."""
+        self._x_fit = x.detach()
+        K = self._k(x, x) + self.noise * torch.eye(len(x), dtype=x.dtype)
+        L = torch.linalg.cholesky(K)
+        self._alpha = torch.cholesky_solve(
+            H_vals.detach().unsqueeze(-1), L
+        ).squeeze(-1)                                          # (M,)
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """H*(x) = k(x, X) @ α  →  (K,)"""
+        return self._k(x, self._x_fit) @ self._alpha
+
+    def gradient(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        ∇H*(x) = Σᵢ αᵢ · k(x, xᵢ) · Λ⁻²(xᵢ - x)  →  (K, nx)
+
+        From:  ∂/∂x k(x, xᵢ) = k(x, xᵢ) · Λ⁻²(xᵢ - x)
+        """
+        inv_l2  = 1.0 / self.lengthscale ** 2                  # (nx,)
+        k       = self._k(x, self._x_fit)                      # (K, M)
+        diff    = self._x_fit[None, :, :] - x[:, None, :]      # (K, M, nx)
+        weights = k * self._alpha[None, :]                      # (K, M)
+        return (weights[:, :, None] * diff * inv_l2).sum(dim=1) # (K, nx)

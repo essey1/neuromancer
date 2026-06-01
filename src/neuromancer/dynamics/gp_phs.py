@@ -275,19 +275,21 @@ class PHSKernel(Kernel):
         inv_lambda  = 1.0 / self.lengthscale           # (nx,)
         inv_lambda2 = inv_lambda ** 2                  # (nx,)
 
-        # weighted difference δ = Λ⁻¹(x1 - x2) : (N, M, nx)
+        # weighted difference δₖ = (x1ₖ - x2ₖ)/λₖ : (N, M, nx)
         delta = (x1[:, None, :] - x2[None, :, :]) * inv_lambda
 
         # scalar RBF : (N, M)
         k_rbf = torch.exp(-0.5 * (delta ** 2).sum(dim=-1))
 
-        # outer product δδᵀ per pair : (N, M, nx, nx)
-        outer = delta[:, :, :, None] * delta[:, :, None, :]
+        # Mixed Hessian: ∂²k/∂xᵢ∂x'ⱼ = k·[δᵢⱼ/λᵢ² − (Δᵢ/λᵢ²)(Δⱼ/λⱼ²)]
+        # outer product needs Δ/λ² not Δ/λ; divide delta by λ again.
+        delta2 = delta * inv_lambda                             # (N, M, nx): Δ/λ²
+        outer  = delta2[:, :, :, None] * delta2[:, :, None, :]  # (N, M, nx, nx)
 
-        # Λ⁻¹ diagonal matrix : (nx, nx)
+        # Λ⁻² diagonal matrix : (nx, nx)
         lambda_inv_diag = torch.diag(inv_lambda2)
 
-        # Hessian H[n,m,i,j] = k_rbf[n,m] · (Λ⁻¹ᵢⱼ - δᵢδⱼ) : (N, M, nx, nx)
+        # H[n,m,i,j] = k_rbf[n,m] · (δᵢⱼ/λᵢ² − (Δᵢ/λᵢ²)(Δⱼ/λⱼ²)) : (N, M, nx, nx)
         H = k_rbf[:, :, None, None] * (lambda_inv_diag - outer)
 
         return k_rbf, H
@@ -377,22 +379,26 @@ class PHSMeanFunction(gpytorch.means.Mean):
 # Component 4 — GPPHSModel
 # ---------------------------------------------------------------------------
 
-class GPPHSModel(gpytorch.models.ExactGP):
+class GPPHSModel(nn.Module):
     """
     Full GP model for Port-Hamiltonian dynamics.
 
     GP prior:
         ẋ ~ GP(G(x)u, k_phs(x, x'))
 
-    x and u are always passed separately — concatenation never happens.
+    x and u are always passed separately.
     The kernel receives x only (k_phs is a function of x alone).
     The mean receives x and u separately (m = G(x)·u needs both).
 
+    Note: does NOT inherit from ExactGP. GPyTorch's ExactGP assumes
+    N inputs → N scalar outputs, but PHS has N inputs → N·nx vector
+    outputs, so the noise shape conflicts. NLML is computed in GPPHSLoss.
+
     Args:
-        train_x    : (N, nx)  — training state trajectories
-        train_u    : (N, nu)  — training control inputs
-        train_xdot : (N·nx,) — training state derivatives, flattened
-        likelihood : gpytorch.likelihoods.Likelihood instance
+        train_x    : (N, nx)  — kept for API compatibility, not stored
+        train_u    : (N, nu)  — kept for API compatibility, not stored
+        train_xdot : (N·nx,) — kept for API compatibility, not stored
+        likelihood : gpytorch.likelihoods.GaussianLikelihood instance
         phs_matrices : PHSMatrices instance
         nx           : state dimension
         nu           : input dimension
@@ -401,11 +407,7 @@ class GPPHSModel(gpytorch.models.ExactGP):
         model = GPPHSModel(train_x, train_u, train_xdot,
                            likelihood, phs_matrices, nx, nu)
 
-        # training
-        pred = model(train_x, train_u)
-
-        # new points
-        pred = model(test_x, test_u)
+        pred = model(x, u)   # MultivariateNormal, mean (N·nx,), covar (N·nx, N·nx)
     """
 
     def __init__(
@@ -418,10 +420,7 @@ class GPPHSModel(gpytorch.models.ExactGP):
         nx: int,
         nu: int,
     ):
-        # GPyTorch internals need a single training input tensor
-        # we concatenate here once, only for the parent class
-        train_xu = torch.cat([train_x, train_u], dim=-1)
-        super().__init__(train_xu, train_xdot, likelihood)
+        super().__init__()
 
         self.nx = nx
         self.nu = nu
@@ -440,12 +439,11 @@ class GPPHSModel(gpytorch.models.ExactGP):
                 mean  : (N·nx,)
                 covar : (N·nx, N·nx)
         """
-        # mean needs both x and u : m = G(x)·u
-        mean  = self.mean_module(x, u)          # (N·nx,)
-
-        # kernel needs x only : k_phs(x, x')
-        covar = self.covar_module(x, x)         # (N·nx, N·nx)
-
+        mean  = self.mean_module.forward(x, u)    # (N·nx,)
+        # Call .forward() directly: Kernel.__call__ wraps the result in
+        # LazyEvaluatedKernelTensor and validates shape as (N, N), but our
+        # kernel intentionally returns (N·nx, N·nx).
+        covar = self.covar_module.forward(x, x)  # (N·nx, N·nx)
         return gpytorch.distributions.MultivariateNormal(mean, covar)
 
 
@@ -494,6 +492,7 @@ class GPPosterior(nn.Module):
         lengthscale:  torch.Tensor,
         signal_var:   torch.Tensor,
         noise_var:    torch.Tensor,
+        **kwargs,     # absorb extra keys from problem.train() dict (e.g. nlml_history)
     ):
         super().__init__()
         self.model        = model
@@ -518,7 +517,7 @@ class GPPosterior(nn.Module):
         """
         Scalar RBF kernel between H values.
 
-            k_HH(x, x') = σ²f · exp(-||x-x'||²_Λ)
+            k_HH(x, x') = σ²f · exp(-0.5·||x-x'||²_Λ)
 
         Args:
             x1 : (N, nx)
@@ -529,8 +528,8 @@ class GPPosterior(nn.Module):
         """
         inv_lambda = 1.0 / self.lengthscale              # (nx,)
         delta      = (x1[:, None, :] - x2[None, :, :])  # (N, M, nx)
-        sq_dist    = ((delta * inv_lambda) ** 2).sum(-1) # (N, M)
-        return self.signal_var * torch.exp(-sq_dist)     # (N, M)
+        sq_dist    = ((delta * inv_lambda) ** 2).sum(-1)        # (N, M)
+        return self.signal_var * torch.exp(-0.5 * sq_dist)      # (N, M)
 
     def _k_xdotH(
         self,
@@ -647,13 +646,18 @@ class GPPosterior(nn.Module):
             K_noise = self._get_K_phs_plus_noise(train_x, train_u)
 
             # ── solve (K_phs + Δ)⁻¹ · k_ẋH via Cholesky ──────────────────
-            # more numerically stable than explicit inverse
-            L = torch.linalg.cholesky(K_noise)                    # (N·nx, N·nx)
+            n_k = K_noise.shape[0]
+            jitter = 1e-6 * torch.eye(n_k, dtype=K_noise.dtype, device=K_noise.device)
+            L = torch.linalg.cholesky(K_noise + jitter)           # (N·nx, N·nx)
 
-            # flatten training xdot to (N·nx,)
-            xdot_flat = train_xdot.reshape(-1)                    # (N·nx,)
+            # subtract prior mean G(x)·u — posterior conditions on the
+            # Hamiltonian residual (J-R)∇H, not the full ẋ which includes G·u
+            G_train = self.phs.get_G(train_x)                     # (N, nx, nu)
+            Gu = (G_train @ train_u.unsqueeze(-1)).squeeze(-1)    # (N, nx)
+            xdot_residual = train_xdot - Gu                       # (N, nx)
+            xdot_flat = xdot_residual.reshape(-1)                 # (N·nx,)
 
-            # α = (K_phs + Δ)⁻¹ · Ẋ : (N·nx,)
+            # α = (K_phs + Δ)⁻¹ · (Ẋ - G·u) : (N·nx,)
             alpha = torch.cholesky_solve(
                 xdot_flat.unsqueeze(-1), L
             ).squeeze(-1)                                          # (N·nx,)
@@ -672,12 +676,14 @@ class GPPosterior(nn.Module):
             H_var  = H_cov.diagonal().clamp(min=0.0)               # (M,)
 
             # ── sample from posterior ──────────────────────────────────────
-            # H ~ N(μ_H, Σ_H)
-            # add jitter to Σ_H for Cholesky stability
-            jitter  = 1e-6 * torch.eye(M, dtype=test_x.dtype, device=test_x.device)
-            L_H     = torch.linalg.cholesky(H_cov + jitter)        # (M, M)
-            eps     = torch.randn(n_samples, M,
-                                  dtype=test_x.dtype, device=test_x.device)
-            H_samples = H_mean[None, :] + (eps @ L_H.T)            # (n_samples, M)
+            # H_cov is theoretically PSD but numerically indefinite due to
+            # floating-point accumulation in the Schur complement. We are
+            # inside torch.no_grad() so eigendecomposition is safe and cheap.
+            eigvals, eigvecs = torch.linalg.eigh(H_cov)   # ascending
+            eigvals_pos = eigvals.clamp(min=0.0)           # nearest PSD
+            L_H = eigvecs @ torch.diag(eigvals_pos.sqrt())  # (M, M)
+            eps = torch.randn(n_samples, M,
+                              dtype=test_x.dtype, device=test_x.device)
+            H_samples = H_mean[None, :] + (eps @ L_H.T)   # (n_samples, M)
 
         return H_mean, H_var, H_samples

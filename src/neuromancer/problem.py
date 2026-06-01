@@ -411,11 +411,18 @@ class GPPHSProblem(nn.Module):
         self.lr         = lr
         self.n_epochs   = n_epochs
 
-        # optimizer over all φ = [φ_J, φ_R, φ_G, Λ, σ_f, noise]
-        self.optimizer = torch.optim.Adam(
-            list(model.parameters()) + list(likelihood.parameters()),
-            lr=lr,
-        )
+        # Deduplicate: PHSMatrices is shared by mean_module.phs and
+        # covar_module.phs, so older PyTorch visits it twice in
+        # named_modules() and yields its parameters twice. Deduplicating
+        # by tensor id ensures each parameter is updated exactly once.
+        seen, unique_params = set(), []
+        for p in list(model.parameters()) + list(likelihood.parameters()):
+            if id(p) not in seen:
+                seen.add(id(p))
+                unique_params.append(p)
+
+        self._params   = unique_params
+        self.optimizer = torch.optim.Adam(unique_params, lr=lr)
 
     def train(
         self,
@@ -426,11 +433,14 @@ class GPPHSProblem(nn.Module):
         self.model.train()
         self.likelihood.train()
 
+        nlml_history = []
         for epoch in range(self.n_epochs):
             self.optimizer.zero_grad()
             loss = self.loss_fn(train_x, train_u, train_xdot)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._params, max_norm=1.0)
             self.optimizer.step()
+            nlml_history.append(loss.item())
 
             if (epoch + 1) % 10 == 0:
                 print(f"Epoch {epoch+1:4d}/{self.n_epochs}  NLML: {loss.item():.4f}")
@@ -438,7 +448,9 @@ class GPPHSProblem(nn.Module):
         self.model.eval()
         self.likelihood.eval()
 
-        return self.get_learned_parameters()
+        learned = self.get_learned_parameters()
+        learned["nlml_history"] = nlml_history
+        return learned
 
     def get_learned_parameters(self):
         """
