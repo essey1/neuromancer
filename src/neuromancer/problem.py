@@ -368,3 +368,119 @@ class Problem(nn.Module):
 
         return s
 
+
+class GPPHSProblem(nn.Module):
+    """
+    Training problem for the GP-PHS model.
+
+    Minimizes NLML to learn φ = [φ_J, φ_R, φ_G, Λ, σ_f].
+    Once trained, the learned parameters in model and likelihood
+    are passed to GPPosterior in gp_phs.py to form the full
+    posterior for ẋ.
+
+    Does not subclass Problem — does not use the node/loss graph pattern.
+
+    Args:
+        model      : GPPHSModel instance
+        likelihood : gpytorch.likelihoods.GaussianLikelihood instance
+        loss_fn    : GPPHSLoss instance
+        lr         : learning rate for Adam optimizer (default 0.1)
+        n_epochs   : number of training epochs (default 100)
+
+    Usage:
+        problem = GPPHSProblem(model, likelihood, loss_fn)
+        problem.train(train_x, train_u, train_xdot)
+
+        # then pass trained model and likelihood to GPPosterior
+        posterior = GPPosterior(model, likelihood)
+        xdot_mean, xdot_var = posterior(test_x, test_u)
+    """
+
+    def __init__(
+        self,
+        model,
+        likelihood,
+        loss_fn,
+        lr:       float = 0.1,
+        n_epochs: int   = 100,
+    ):
+        super().__init__()
+        self.model      = model
+        self.likelihood = likelihood
+        self.loss_fn    = loss_fn
+        self.lr         = lr
+        self.n_epochs   = n_epochs
+
+        # Deduplicate: PHSMatrices is shared by mean_module.phs and
+        # covar_module.phs, so older PyTorch visits it twice in
+        # named_modules() and yields its parameters twice. Deduplicating
+        # by tensor id ensures each parameter is updated exactly once.
+        seen, unique_params = set(), []
+        for p in list(model.parameters()) + list(likelihood.parameters()):
+            if id(p) not in seen:
+                seen.add(id(p))
+                unique_params.append(p)
+
+        self._params   = unique_params
+        self.optimizer = torch.optim.Adam(unique_params, lr=lr)
+
+    def train(
+        self,
+        train_x:    torch.Tensor,
+        train_u:    torch.Tensor,
+        train_xdot: torch.Tensor,
+        xdot_var:   torch.Tensor = None,
+    ):
+        """
+        Args:
+            train_x    : (N, nx)
+            train_u    : (N, nu)
+            train_xdot : (N, nx) or (N·nx,)
+            xdot_var   : (N, nx) derivative variances from gp_smoother (optional).
+                         If provided, replaces likelihood.noise * I with diag(xdot_var)
+                         in the NLML — uses the paper's true Δ matrix.
+        """
+        self.model.train()
+        self.likelihood.train()
+
+        nlml_history = []
+        for epoch in range(self.n_epochs):
+            self.optimizer.zero_grad()
+            loss = self.loss_fn(train_x, train_u, train_xdot, xdot_var)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._params, max_norm=1.0)
+            self.optimizer.step()
+            nlml_history.append(loss.item())
+
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1:4d}/{self.n_epochs}  NLML: {loss.item():.4f}")
+
+        self.model.eval()
+        self.likelihood.eval()
+
+        learned = self.get_learned_parameters()
+        learned["nlml_history"] = nlml_history
+        return learned
+
+    def get_learned_parameters(self):
+        """
+        Package all learned parameters for GPPosterior.
+
+        Returns dict containing:
+            model       : trained GPPHSModel — carries φ_J, φ_R, φ_G, Λ, σ_f
+            likelihood  : trained GaussianLikelihood — carries noise variance
+            phs_matrices: trained PHSMatrices — carries learned J, R, G structure
+            lengthscale : (nx,)  learned Λ diagonal
+            signal_var  : ()     learned σ_f
+            noise_var   : ()     learned noise variance from likelihood
+        """
+        kernel = self.model.covar_module
+
+        return {
+            "model":        self.model,
+            "likelihood":   self.likelihood,
+            "phs_matrices": self.model.covar_module.phs,
+            "lengthscale":  kernel.lengthscale.detach(),
+            "signal_var":   kernel.signal_var.detach(),
+            "noise_var":    self.likelihood.noise.detach(),
+        }

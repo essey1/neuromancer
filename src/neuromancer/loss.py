@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from neuromancer.constraint import Constraint
 
 
+
 class AggregateLoss(nn.Module, ABC):
     """
     Abstract aggregate loss class for calculating constraints, objectives, and aggegate loss values.
@@ -342,12 +343,94 @@ class AugmentedLagrangeLoss(AggregateLoss):
             input_dict['loss'] += scaled_penalty_loss
 
         return input_dict
+    
+# ──────────────────────────────────────────────────────────────────────────
+# GP-PHS Loss  (does not subclass AggregateLoss — different paradigm)
+# ──────────────────────────────────────────────────────────────────────────
+
+class GPPHSLoss(nn.Module):
+    """
+    NLML loss for the GP-PHS model.
+
+    Computes the negative marginal log-likelihood directly via Cholesky:
+
+        NLML = 0.5 · rᵀ(K+σ²I)⁻¹r + 0.5 · log|K+σ²I| + const
+
+    where r = ẋ_flat - μ(x,u) is the residual over all N·nx observations.
+
+    GPyTorch's ExactMarginalLogLikelihood cannot be used here because
+    ExactGP assumes N inputs → N scalar outputs, but PHS has N inputs →
+    N·nx outputs (the noise would be (N,N) vs the kernel (N·nx, N·nx)).
+
+    Args:
+        model      : GPPHSModel instance
+        likelihood : gpytorch.likelihoods.GaussianLikelihood instance
+
+    Usage:
+        loss_fn = GPPHSLoss(model, likelihood)
+        loss = loss_fn(x, u, xdot)
+        loss.backward()
+    """
+
+    def __init__(self, model, likelihood):
+        super().__init__()
+        self.model      = model
+        self.likelihood = likelihood
+
+    def forward(
+        self,
+        x:        torch.Tensor,
+        u:        torch.Tensor,
+        xdot:     torch.Tensor,
+        xdot_var: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Compute negative NLML loss.
+
+        Args:
+            x        : (N, nx)   state
+            u        : (N, nu)   control input
+            xdot     : (N·nx,) or (N, nx)  state derivatives
+            xdot_var : (N, nx)   derivative variances from gp_smoother (Δ diagonal).
+                       If None, falls back to likelihood.noise * I.
+
+        Returns:
+            scalar loss — minimizing this maximizes the marginal likelihood
+        """
+        y = xdot.reshape(-1)                    # (N·nx,)
+
+        dist  = self.model(x, u)
+        mean  = dist.mean                       # (N·nx,)
+        K     = dist.lazy_covariance_matrix.to_dense()  # (N·nx, N·nx)
+
+        n = K.shape[0]
+        if xdot_var is not None:
+            Delta = torch.diag(xdot_var.reshape(-1).to(dtype=K.dtype, device=K.device))
+        else:
+            Delta = self.likelihood.noise * torch.eye(n, dtype=K.dtype, device=K.device)
+        K_noisy = K + Delta
+
+        residual = y - mean                     # (N·nx,)
+
+        log2pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=K.dtype, device=K.device))
+
+        # Small fixed jitter for floating-point stability. The PHS kernel is
+        # PSD by construction (correct mixed Hessian formula), so 1e-6 is enough.
+        jitter  = 1e-6 * torch.eye(n, dtype=K.dtype, device=K.device)
+        L       = torch.linalg.cholesky(K_noisy + jitter)
+        alpha   = torch.cholesky_solve(residual.unsqueeze(-1), L).squeeze(-1)
+
+        nlml = (0.5 * (residual @ alpha)
+                + L.diagonal().log().sum()
+                + 0.5 * n * log2pi)
+        return nlml
 
 
 losses = {'penalty': PenaltyLoss,
           'barrier': BarrierLoss,
-          'augmented_lagrange': AugmentedLagrangeLoss}
-
+          'augmented_lagrange': AugmentedLagrangeLoss,
+          'gp_phs': GPPHSLoss,
+        }
 
 def get_loss(objectives, constraints, train_data, args):
     if args.loss == 'penalty':
@@ -360,3 +443,6 @@ def get_loss(objectives, constraints, train_data, args):
                           'mu_init': args.mu_init, "mu_max": args.mu_max}
         loss = AugmentedLagrangeLoss(objectives, constraints, train_data, **optimizer_args)
     return loss
+
+def get_gpphs_loss(model, likelihood):
+    return GPPHSLoss(model, likelihood)
