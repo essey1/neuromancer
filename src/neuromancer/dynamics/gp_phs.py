@@ -693,3 +693,62 @@ class GPPosterior(nn.Module):
             H_samples = H_mean[None, :] + (eps @ L_H.T)   # (n_samples, M)
 
         return H_mean, H_var, H_samples
+
+
+# ---------------------------------------------------------------------------
+# Component 6 — GPPHSNode  (Neuromancer Node-compatible wrapper)
+# ---------------------------------------------------------------------------
+
+class GPPHSNode(nn.Module):
+    """
+    Node-compatible wrapper that integrates GPPHSModel into Neuromancer's
+    Problem / Trainer training loop.
+
+    ``GPPHSModel`` does not store training data (see its docstring), so the
+    model can be initialised immediately with dummy inputs — all learnable
+    parameters (kernel hyperparams, likelihood noise, PHS structure) are
+    registered as proper ``nn.Module`` children and therefore captured by
+    ``Problem.parameters()`` and the optimizer.
+
+    Usage::
+
+        gpphs_module = GPPHSNode(phs, nx=2, nu=1)
+        gpphs_node   = Node(gpphs_module,
+                            ['X', 'U', 'Xdot', 'Xdot_var'], ['nlml'],
+                            name='gp_phs')
+        loss    = PenaltyLoss([variable('nlml').minimize()], [])
+        problem = Problem([gpphs_node], loss)
+    """
+
+    def __init__(self, phs_matrices: 'PHSMatrices', nx: int, nu: int):
+        super().__init__()
+        self.phs        = phs_matrices
+        self.nx, self.nu = nx, nu
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        # dummy inputs — GPPHSModel does not store train data, so this is safe
+        self.gp_model   = GPPHSModel(None, None, None, self.likelihood, self.phs, nx, nu)
+        self._loss_fn   = None
+
+    def forward(
+        self,
+        X:        torch.Tensor,
+        U:        torch.Tensor,
+        Xdot:     torch.Tensor,
+        Xdot_var: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            X        : (N, nx)  state
+            U        : (N, nu)  control input
+            Xdot     : (N, nx)  state derivatives
+            Xdot_var : (N, nx)  derivative variances from gp_smoother (optional)
+
+        Returns:
+            scalar NLML — stored under key ``'nlml'`` in the problem dict
+        """
+        if self._loss_fn is None:
+            from neuromancer.loss import GPPHSLoss
+            self._loss_fn = GPPHSLoss(self.gp_model, self.likelihood)
+        self.gp_model.train(self.training)
+        self.likelihood.train(self.training)
+        return self._loss_fn(X, U, Xdot, xdot_var=Xdot_var)
