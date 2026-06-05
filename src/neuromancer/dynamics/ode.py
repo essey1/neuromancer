@@ -624,12 +624,13 @@ class PHSODE(ODESystem):
             u_t = self._resolve_u(u, x, t, t_eval)
             return self.ode_equations(x, u_t, ham)
 
-        trajectory = odeint(
-            rhs,
-            x0,
-            t_eval,
-            method=self.method,
-        )                                              # (T, batch, nx)
+        with torch.no_grad():
+            trajectory = odeint(
+                rhs,
+                x0,
+                t_eval,
+                method=self.method,
+            )                                          # (T, batch, nx)
 
         return trajectory
 
