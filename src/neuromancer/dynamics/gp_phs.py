@@ -26,7 +26,8 @@ import torch.nn as nn
 import gpytorch
 from gpytorch.kernels import Kernel
 from linear_operator.operators import DenseLinearOperator
-from typing import Callable, Dict, Optional, Tuple
+import dis
+from typing import Callable, Dict, Tuple
 
 Entry = Callable[[torch.Tensor], torch.Tensor]
 
@@ -37,15 +38,16 @@ Entry = Callable[[torch.Tensor], torch.Tensor]
 
 def _extract_closure_parameters(fn) -> Dict[str, nn.Parameter]:
     """
-    Walk a callable's __closure__ and collect any nn.Parameter or
-    nn.Module objects so they can be registered with PyTorch.
-
-    Works for plain lambdas, nested defs, and nn.Module instances.
+    Collect nn.Parameter / nn.Module objects referenced by a callable,
+    whether captured via closure (enclosing function scope) or accessed
+    as a global (module / Jupyter notebook scope).
     """
     if isinstance(fn, nn.Module):
         return dict(fn.named_parameters())
 
-    params = {}
+    params: Dict[str, nn.Parameter] = {}
+
+    # 1. Closure cells — lambda defined inside a function
     for i, cell in enumerate(getattr(fn, "__closure__", None) or []):
         try:
             val = cell.cell_contents
@@ -56,6 +58,25 @@ def _extract_closure_parameters(fn) -> Dict[str, nn.Parameter]:
         elif isinstance(val, nn.Module):
             for name, p in val.named_parameters():
                 params[f"closure_{i}_{name}"] = p
+
+    # 2. Global lookups — lambda defined at notebook / module scope,
+    #    where the variable is accessed via LOAD_GLOBAL not LOAD_DEREF
+    try:
+        globs = getattr(fn, "__globals__", {})
+        for instr in dis.get_instructions(fn):
+            if instr.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
+                name = instr.argval
+                val = globs.get(name)
+                if isinstance(val, nn.Parameter) and name not in params:
+                    params[name] = val
+                elif isinstance(val, nn.Module) and not isinstance(val, nn.Parameter):
+                    for pname, p in val.named_parameters():
+                        key = f"{name}_{pname}"
+                        if key not in params:
+                            params[key] = p
+    except Exception:
+        pass
+
     return params
 
 
@@ -81,7 +102,6 @@ class PHSMatrices(nn.Module):
                       PSD enforced: R = diag(d²)
         G_full      : full (nx, nu) entries of G
                       dict[(i,j)] -> callable(x) -> (batch,)
-        extra_parameters : explicitly register params the closure scan misses
 
     Example
     -------
@@ -115,7 +135,6 @@ class PHSMatrices(nn.Module):
         J_upper: Dict[Tuple[int, int], Entry],
         R_diag:  Dict[int, Entry],
         G_full:  Dict[Tuple[int, int], Entry],
-        extra_parameters: Optional[Dict[str, nn.Parameter]] = None,
     ):
         super().__init__()
         self.nx = nx
@@ -162,10 +181,6 @@ class PHSMatrices(nn.Module):
                     reg = f"{tag}_{key}_{pname}"
                     if reg not in dict(self.named_parameters()):
                         self.register_parameter(reg, param)
-
-        if extra_parameters:
-            for name, param in extra_parameters.items():
-                self.register_parameter(f"extra_{name}", param)
 
     # ── matrix constructors ────────────────────────────────────────────────
 
