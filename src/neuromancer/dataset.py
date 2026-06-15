@@ -974,119 +974,122 @@ def get_sequence_dataloaders(
 
     return (train_data, dev_data, test_data), (train_loop, dev_loop, test_loop), train_data.dataset.dims
 
+def _build_gpphs_loaders(x, x_dot, u, x_dot_var, split_ratio, batch_size, num_workers):
+    """Internal helper: validate, split, wrap, return loaders + plot_data."""
+    if x.ndim == 1:         x = x.reshape(-1, 1)
+    if x_dot.ndim == 1:     x_dot = x_dot.reshape(-1, 1)
+    if u is not None and u.ndim == 1:           u = u.reshape(-1, 1)
+    if x_dot_var is not None and x_dot_var.ndim == 1: x_dot_var = x_dot_var.reshape(-1, 1)
+
+    assert x.shape == x_dot.shape, \
+        f"x shape {x.shape} and x_dot shape {x_dot.shape} must match"
+    if u is not None:
+        assert u.shape[0] == x.shape[0], \
+            f"u has {u.shape[0]} rows but x has {x.shape[0]}"
+    if x_dot_var is not None:
+        assert x_dot_var.shape == x_dot.shape, \
+            f"x_dot_var shape {x_dot_var.shape} must match x_dot shape {x_dot.shape}"
+
+    data = {'X': x.astype(np.float32), 'Xdot': x_dot.astype(np.float32)}
+    if u is not None:
+        data['U'] = u.astype(np.float32)
+    if x_dot_var is not None:
+        data['Xdot_var'] = x_dot_var.astype(np.float32)
+
+    train_data, dev_data, test_data = split_static_data(data, split_ratio)
+    train_ds = StaticDataset(train_data, name='train')
+    dev_ds   = StaticDataset(dev_data,   name='dev')
+    test_ds  = StaticDataset(test_data,  name='test')
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              collate_fn=train_ds.collate_fn, num_workers=num_workers)
+    dev_loader   = DataLoader(dev_ds,   batch_size=batch_size, shuffle=False,
+                              collate_fn=dev_ds.collate_fn,   num_workers=num_workers)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              collate_fn=test_ds.collate_fn,  num_workers=num_workers)
+
+    return train_loader, dev_loader, test_loader
+
+
 def prepare_gpphs_data(
+    X0_list,
+    sigs,
+    dynamics,
+    T_sim,
+    n_points,
+    noise_std=0.01,
+    gp_smooth_kwargs=None,
+    split_ratio=None,
+    batch_size=32,
+    num_workers=0,
+):
+    """
+    Simulate trajectories, apply GP smoothing, and return DataLoaders.
+    Use this when you have a dynamics function and want everything handled.
+
+    Returns: train_loader, dev_loader, test_loader, plot_data
+    """
+    from scipy.integrate import odeint
+    from neuromancer.psl.gp_smoother import gp_smooth
+
+    gp_smooth_kwargs = gp_smooth_kwargs or {}
+    trajs, xdots, xdot_vars, us, t_nps = [], [], [], [], []
+    x_trues, x_noisys = [], []
+
+    for i, (x0, sig) in enumerate(zip(X0_list, sigs)):
+        t_i    = np.linspace(i * T_sim, (i + 1) * T_sim, n_points)
+        traj_i = odeint(lambda state, t, s=sig: dynamics(state, t, s), x0, t_i)
+        u_i    = np.array([sig(t) for t in t_i])
+
+        rng     = np.random.default_rng(i)
+        x_noisy = traj_i + rng.normal(0, noise_std, traj_i.shape)
+
+        x_smooth_i, xdot_i, xdot_var_i = gp_smooth(t_i, x_noisy, **gp_smooth_kwargs)
+
+        trajs.append(x_smooth_i);     xdots.append(xdot_i)
+        xdot_vars.append(xdot_var_i); us.append(u_i)
+        t_nps.append(t_i);            x_trues.append(traj_i)
+        x_noisys.append(x_noisy)
+
+    train_loader, dev_loader, test_loader = _build_gpphs_loaders(
+        x=np.concatenate(trajs),
+        x_dot=np.concatenate(xdots),
+        u=np.concatenate(us),
+        x_dot_var=np.concatenate(xdot_vars),
+        split_ratio=split_ratio,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+    plot_data = {
+        't_nps': t_nps, 'x_trues': x_trues, 'x_noisys': x_noisys,
+        'trajs': trajs, 'xdots': xdots, 'xdot_vars': xdot_vars,
+    }
+
+    return train_loader, dev_loader, test_loader, plot_data
+
+
+def gpphs_data_from_arrays(
     x,
     x_dot,
     u=None,
     x_dot_var=None,
     split_ratio=None,
     batch_size=32,
-):
-    """
-    Prepare StaticDatasets for GP-PHS pointwise (NLML) training.
-
-    Assumes x_dot is already available — either measured directly or
-    estimated via gp_smoother.gp_smooth(), which also returns x_dot_var.
-    Pass x_dot_var to include per-point derivative variances (Δ diagonal)
-    so GPPHSLoss and GPPosterior can use the paper-correct noise matrix.
-
-    Each mini-batch is a random set of independent (x, x_dot[, u]) tuples;
-    time ordering does NOT matter here (the GP loss is pointwise).
-
-    Compatible with LitDataModule as a data_setup_function:
-
-        dm = LitDataModule(prepare_gpphs_data, x=x, x_dot=x_dot, u=u, batch_size=32)
-
-    :param x:           (np.ndarray) State observations,      shape (T, nx) or (T,)
-    :param x_dot:       (np.ndarray) Derivative observations, shape (T, nx) or (T,)
-    :param u:           (np.ndarray) Control inputs,          shape (T, nu) or (T,)
-                        Pass None if there is no control input.
-    :param split_ratio: (list) [train_pct, dev_pct] out of 100.0, e.g. [60.0, 20.0].
-                        Default None splits into equal thirds.
-    :param batch_size:  (int) Samples per mini-batch. Default 32.
-
-    :return: train_ds, dev_ds, test_ds, batch_size
-    """
-    # 1. Auto-promote 1D inputs to 2D
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    if x_dot.ndim == 1:
-        x_dot = x_dot.reshape(-1, 1)
-    if u is not None and u.ndim == 1:
-        u = u.reshape(-1, 1)
-
-    # 2. Validate shapes
-    assert x.ndim == 2,     f"x must be 1D or 2D, got shape {x.shape}"
-    assert x_dot.ndim == 2, f"x_dot must be 1D or 2D, got shape {x_dot.shape}"
-    assert x.shape == x_dot.shape, \
-        f"x shape {x.shape} and x_dot shape {x_dot.shape} must match"
-    if u is not None:
-        assert u.ndim == 2, f"u must be 1D or 2D, got shape {u.shape}"
-        assert u.shape[0] == x.shape[0], \
-            f"u has {u.shape[0]} rows but x has {x.shape[0]}"
-
-    # 3. Pack into dict (ensure float32)
-    data = {
-        'X':    x.astype(np.float32),
-        'Xdot': x_dot.astype(np.float32),
-    }
-    if u is not None:
-        data['U'] = u.astype(np.float32)
-    if x_dot_var is not None:
-        if x_dot_var.ndim == 1:
-            x_dot_var = x_dot_var.reshape(-1, 1)
-        assert x_dot_var.shape == x_dot.shape, \
-            f"x_dot_var shape {x_dot_var.shape} must match x_dot shape {x_dot.shape}"
-        data['Xdot_var'] = x_dot_var.astype(np.float32)
-
-    # 4. Split
-    train_data, dev_data, test_data = split_static_data(data, split_ratio)
-
-    # 5. Wrap in StaticDatasets — keys X, Xdot, U are the contract
-    #    that the downstream GP-PHS model expects in every batch
-    train_ds = StaticDataset(train_data, name='train')
-    dev_ds   = StaticDataset(dev_data,   name='dev')
-    test_ds  = StaticDataset(test_data,  name='test')
-
-    return train_ds, dev_ds, test_ds, batch_size
-
-
-def get_gpphs_dataloaders(
-    x,
-    x_dot,
-    u=None,
-    split_ratio=None,
-    batch_size=32,
     num_workers=0,
 ):
     """
-    Convenience wrapper around prepare_gpphs_data that builds and returns
-    DataLoaders directly. Use this when working outside of LitDataModule.
+    Build GP-PHS DataLoaders from pre-computed arrays.
+    Use this when you already have smoothed states and derivative estimates
+    (e.g. from your own preprocessing pipeline or gp_smooth called manually).
 
-    :param x:           (np.ndarray) State observations,      shape (T, nx) or (T,)
-    :param x_dot:       (np.ndarray) Derivative observations, shape (T, nx) or (T,)
-    :param u:           (np.ndarray) Control inputs,          shape (T, nu) or (T,)
-    :param split_ratio: (list) [train_pct, dev_pct] e.g. [60.0, 20.0]
-    :param batch_size:  (int) Samples per mini-batch.
-    :param num_workers: (int) DataLoader worker processes.
+    Args:
+        x         : (T, nx) smoothed state observations
+        x_dot     : (T, nx) derivative estimates
+        u         : (T, nu) control inputs, or None
+        x_dot_var : (T, nx) derivative variances from gp_smooth, or None
 
-    :return: (train_loader, dev_loader, test_loader), dims
+    Returns: train_loader, dev_loader, test_loader
     """
-    train_ds, dev_ds, test_ds, batch_size = prepare_gpphs_data(
-        x, x_dot, u=u, split_ratio=split_ratio, batch_size=batch_size,
-    )
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=train_ds.collate_fn, num_workers=num_workers,
-    )
-    dev_loader = DataLoader(
-        dev_ds, batch_size=batch_size, shuffle=False,
-        collate_fn=dev_ds.collate_fn, num_workers=num_workers,
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        collate_fn=test_ds.collate_fn, num_workers=num_workers,
-    )
-
-    return (train_loader, dev_loader, test_loader), train_ds.dims
+    return _build_gpphs_loaders(x, x_dot, u, x_dot_var,
+                                split_ratio, batch_size, num_workers)
