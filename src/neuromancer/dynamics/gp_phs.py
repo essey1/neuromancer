@@ -21,16 +21,64 @@ Entry signature for all matrices (J, R, G):
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import gpytorch
 from gpytorch.kernels import Kernel
 from linear_operator.operators import DenseLinearOperator
 import dis
 from typing import Callable, Dict, Tuple
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+
+from neuromancer.dynamics.ode import PHSODE
 
 Entry = Callable[[torch.Tensor], torch.Tensor]
 
+
+
+# Maps id(raw) -> (raw, name, recovery_fn)
+_PARAM_REGISTRY: Dict[int, Tuple[nn.Parameter, str, callable]] = {}
+
+def positive_param(name: str, init_value: float = 1.0) -> nn.Parameter:
+    assert init_value > 0
+    raw = nn.Parameter(torch.tensor(math.log(init_value)))
+    _PARAM_REGISTRY[id(raw)] = (raw, name, torch.exp)
+    return raw
+
+def nonneg_param(name: str, init_value: float = 0.5) -> nn.Parameter:
+    assert init_value >= 0
+    raw_init = math.log(math.expm1(init_value)) if init_value > 0 else -math.log(2)
+    raw = nn.Parameter(torch.tensor(raw_init))
+    _PARAM_REGISTRY[id(raw)] = (raw, name, F.softplus)
+    return raw
+
+def recover(raw: nn.Parameter) -> torch.Tensor:
+    entry = _PARAM_REGISTRY.get(id(raw))
+    if entry is None:
+        raise KeyError("Parameter not registered — use positive_param() or nonneg_param()")
+    _, _, fn = entry
+    return fn(raw)
+
+def param_table(param_map: Dict[str, Tuple[nn.Parameter, float]]) -> "pd.DataFrame":
+    import pandas as pd
+    rows = []
+    for display_name, (raw, true_val) in param_map.items():
+        learned = recover(raw).detach().item()
+        rows.append({
+            'Parameter':   display_name,
+            'True':        true_val,
+            'Learned':     learned,
+            'Rel. Error %': 100 * abs(learned - true_val) / (abs(true_val) + 1e-6)
+        })
+    df = pd.DataFrame(rows)
+    print(df.to_string(index=False))
+    print(f'\nMean relative error:   {df["Rel. Error %"].mean():.2f}%')
+    print(f'Median relative error: {df["Rel. Error %"].median():.2f}%')
+    return df
 
 # ---------------------------------------------------------------------------
 # Helper: extract nn.Parameters from a callable's closure
@@ -204,7 +252,7 @@ class PHSMatrices(nn.Module):
         d = torch.zeros(batch, self.nx, dtype=x.dtype, device=x.device)
         for i, fn in self._R_diag.items():
             d[:, i] = fn(x)
-        return torch.diag_embed(d ** 2)
+        return torch.diag_embed(d)
 
     def get_G(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -342,6 +390,12 @@ class PHSKernel(Kernel):
 
         # step 5: block reshape (N, M, nx, nx) → (N·nx, M·nx)
         K_out = K_phs.permute(0, 2, 1, 3).reshape(N * self.nx, M * self.nx)
+
+        # Jitter for numerical stability: if R has zero diagonal entries, (J-R) is
+        # rank-deficient and K becomes singular. Scaled jitter keeps it positive-definite
+        # without dominating the kernel signal.
+        jitter = K_out.diagonal().mean() * 1e-4
+        K_out = K_out + torch.eye(K_out.shape[0], device=K_out.device) * jitter
 
         return DenseLinearOperator(K_out)
 
@@ -708,6 +762,50 @@ class GPPosterior(nn.Module):
             H_samples = H_mean[None, :] + (eps @ L_H.T)   # (n_samples, M)
 
         return H_mean, H_var, H_samples
+    def predict(
+        self,
+        smoothed,
+        us,
+        xdots,
+        xdot_vars,
+        test_x=None,
+        n_samples=50,
+    ):
+        """
+        Convenience wrapper around GPPosterior.forward().
+        """
+
+        train_x = torch.tensor(
+            np.concatenate(smoothed),
+            dtype=torch.float32,
+        )
+
+        train_u = torch.tensor(
+            np.concatenate(us),
+            dtype=torch.float32,
+        )
+
+        train_xdot = torch.tensor(
+            np.concatenate(xdots),
+            dtype=torch.float32,
+        )
+
+        xdot_var_t = torch.tensor(
+            np.concatenate(xdot_vars),
+            dtype=torch.float32,
+        )
+
+        if test_x is None:
+            test_x = train_x
+
+        return self(
+            train_x=train_x,
+            train_u=train_u,
+            train_xdot=train_xdot,
+            test_x=test_x,
+            xdot_var=xdot_var_t,
+            n_samples=n_samples,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +838,11 @@ class GPPHSNode(nn.Module):
         self.phs        = phs_matrices
         self.nx, self.nu = nx, nu
         self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        self.likelihood.noise = torch.tensor(1e-3)
+        self.likelihood.noise_covar.register_constraint(  # ← noise_covar, not likelihood directly
+            "raw_noise",
+            gpytorch.constraints.GreaterThan(1e-4)
+        )
         # dummy inputs — GPPHSModel does not store train data, so this is safe
         self.gp_model   = GPPHSModel(None, None, None, self.likelihood, self.phs, nx, nu)
         self._loss_fn   = None
@@ -761,9 +864,33 @@ class GPPHSNode(nn.Module):
         Returns:
             scalar NLML — stored under key ``'nlml'`` in the problem dict
         """
+        # On the first forward pass, initialize signal variance from the scale
+        # of the observed derivatives. This prevents the optimizer from starting
+        # in a near-zero basin where the GP ignores dynamics structure entirely.
+        if not hasattr(self, '_initialized'):
+            with torch.no_grad():
+                xdot_var_estimate = Xdot.var()
+                self.gp_model.covar_module.raw_signal_var.data.fill_(
+                    torch.log(xdot_var_estimate.clamp(min=1e-6)).item()
+                )
+            self._initialized = True
+
         if self._loss_fn is None:
             from neuromancer.loss import GPPHSLoss
             self._loss_fn = GPPHSLoss(self.gp_model, self.likelihood)
         self.gp_model.train(self.training)
         self.likelihood.train(self.training)
         return self._loss_fn(X, U, Xdot, xdot_var=Xdot_var)
+    
+    def posterior(self):
+        """
+        Construct a GPPosterior using the currently learned model parameters.
+        """
+        return GPPosterior(
+            model=self.gp_model,
+            likelihood=self.likelihood,
+            phs_matrices=self.phs,
+            lengthscale=self.gp_model.covar_module.lengthscale.detach(),
+            signal_var=self.gp_model.covar_module.signal_var.detach(),
+            noise_var=self.likelihood.noise.detach(),
+        )
