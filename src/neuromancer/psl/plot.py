@@ -429,19 +429,20 @@ def pltHamiltonian(H_mean, H_var, H_true=None, figname=None):
         plt.savefig(figname)
     plt.show()
 
-def pltXdot(xdot_pred, xdot_true=None, state_lbls=None, figname=None):
+def pltXdot(xdot_pred, xdot_true=None, xdot_std=None, state_lbls=None, figname=None):
     """
     Plot pointwise derivative prediction vs true derivatives at training points.
 
     Args:
-        xdot_true  : (N, nx) true derivatives
         xdot_pred  : (N, nx) predicted derivatives
+        xdot_true  : (N, nx) true derivatives (optional)
+        xdot_std   : (N, nx) std of predicted derivatives (optional)
         state_lbls : list of state labels (optional)
         figname    : path to save figure (optional)
     """
-    nx     = xdot_true.shape[1]
+    nx     = xdot_pred.shape[1]
     colors = get_colors(nx)
-    idx    = np.arange(len(xdot_true))
+    idx    = np.arange(len(xdot_pred))
 
     if state_lbls is None:
         state_lbls = [f'$\\dot{{x}}_{{{d+1}}}$' for d in range(nx)]
@@ -452,7 +453,13 @@ def pltXdot(xdot_pred, xdot_true=None, state_lbls=None, figname=None):
 
     for d, (lbl, col) in enumerate(zip(state_lbls, colors)):
         axes[d].plot(idx, xdot_pred[:, d], color=col, label='learned')
-        axes[d].plot(idx, xdot_true[:, d], 'k--', lw=1, label='true')
+        if xdot_std is not None:
+            axes[d].fill_between(idx,
+                                 xdot_pred[:, d] - 2*xdot_std[:, d],
+                                 xdot_pred[:, d] + 2*xdot_std[:, d],
+                                 alpha=0.2, color=col)
+        if xdot_true is not None:
+            axes[d].plot(idx, xdot_true[:, d], 'k--', lw=1, label='true')
         axes[d].set_title(lbl)
         axes[d].set_xlabel('training point index')
         axes[d].set_ylabel('$\\dot{x}$')
@@ -462,9 +469,8 @@ def pltXdot(xdot_pred, xdot_true=None, state_lbls=None, figname=None):
     plt.suptitle('Pointwise derivative prediction at training points')
     plt.tight_layout()
     if figname is not None:
-        plt.savefig(figname)
+        plt.savefcall(figname)
     plt.show()
-
 
 def pltTrajectory(t, x_pred, x_true=None, std=None, state_lbls=None, figname=None):
     nx     = x_pred.shape[1]
