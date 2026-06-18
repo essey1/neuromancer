@@ -15,6 +15,9 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 
+from neuromancer.dynamics.gp_phs import GPPosterior
+
+
 class LitDataModule(pl.LightningDataModule):
     """
     A Neuromancer-specific class inheriting from PyTorch Lightning LightningDataModule
@@ -975,7 +978,7 @@ def get_sequence_dataloaders(
     return (train_data, dev_data, test_data), (train_loop, dev_loop, test_loop), train_data.dataset.dims
 
 def _build_gpphs_loaders(x, x_dot, u, x_dot_var, split_ratio, batch_size, num_workers):
-    """Internal helper: validate, split, wrap, return loaders + plot_data."""
+    """Internal helper: validate, split, wrap, return loaders."""
     if x.ndim == 1:         x = x.reshape(-1, 1)
     if x_dot.ndim == 1:     x_dot = x_dot.reshape(-1, 1)
     if u is not None and u.ndim == 1:           u = u.reshape(-1, 1)
@@ -1025,33 +1028,31 @@ def prepare_gpphs_data(
 ):
     """
     Simulate trajectories, apply GP smoothing, and return DataLoaders.
-    Use this when you have a dynamics function and want everything handled.
+    Use this when you have a dynamics function and want everything handled
+    in one call. For a transparent step-by-step pipeline, use gp_smooth
+    followed by gpphs_data_from_arrays instead.
 
-    Returns: train_loader, dev_loader, test_loader, plot_data
+    Returns: train_loader, dev_loader, test_loader
     """
     from scipy.integrate import odeint
     from neuromancer.psl.gp_smoother import gp_smooth
 
     gp_smooth_kwargs = gp_smooth_kwargs or {}
-    trajs, xdots, xdot_vars, us, t_nps = [], [], [], [], []
-    x_trues, x_noisys = [], []
+    trajs, xdots, xdot_vars, us = [], [], [], []
 
     for i, (x0, sig) in enumerate(zip(X0_list, sigs)):
-        t_i    = np.linspace(i * T_sim, (i + 1) * T_sim, n_points)
-        traj_i = odeint(lambda state, t, s=sig: dynamics(state, t, s), x0, t_i)
-        u_i    = np.array([sig(t) for t in t_i])
-
+        t_i     = np.linspace(i * T_sim, (i + 1) * T_sim, n_points)
+        traj_i  = odeint(lambda state, t, s=sig: dynamics(state, t, s), x0, t_i)
+        u_i     = np.array([sig(t) for t in t_i])
         rng     = np.random.default_rng(i)
         x_noisy = traj_i + rng.normal(0, noise_std, traj_i.shape)
 
         x_smooth_i, xdot_i, xdot_var_i = gp_smooth(t_i, x_noisy, **gp_smooth_kwargs)
 
-        trajs.append(x_smooth_i);     xdots.append(xdot_i)
+        trajs.append(x_smooth_i); xdots.append(xdot_i)
         xdot_vars.append(xdot_var_i); us.append(u_i)
-        t_nps.append(t_i);            x_trues.append(traj_i)
-        x_noisys.append(x_noisy)
 
-    train_loader, dev_loader, test_loader = _build_gpphs_loaders(
+    return _build_gpphs_loaders(
         x=np.concatenate(trajs),
         x_dot=np.concatenate(xdots),
         u=np.concatenate(us),
@@ -1060,13 +1061,6 @@ def prepare_gpphs_data(
         batch_size=batch_size,
         num_workers=num_workers,
     )
-
-    plot_data = {
-        't_nps': t_nps, 'x_trues': x_trues, 'x_noisys': x_noisys,
-        'trajs': trajs, 'xdots': xdots, 'xdot_vars': xdot_vars,
-    }
-
-    return train_loader, dev_loader, test_loader, plot_data
 
 
 def gpphs_data_from_arrays(
@@ -1093,3 +1087,23 @@ def gpphs_data_from_arrays(
     """
     return _build_gpphs_loaders(x, x_dot, u, x_dot_var,
                                 split_ratio, batch_size, num_workers)
+
+
+def build_gpphs_tensors(smoothed, us, xdots, xdot_vars):
+    """
+    Convert pre-computed GP smoother output lists to tensors for GPPosterior.
+
+    Args:
+        smoothed   : list of (T, nx) smoothed state arrays
+        us         : list of (T, nu) control input arrays
+        xdots      : list of (T, nx) derivative mean arrays
+        xdot_vars  : list of (T, nx) derivative variance arrays
+
+    Returns: train_x, train_u, train_xdot, xdot_var_t  — all torch.float32
+    """
+    return (
+        torch.tensor(np.concatenate(smoothed),  dtype=torch.float32),
+        torch.tensor(np.concatenate(us),        dtype=torch.float32),
+        torch.tensor(np.concatenate(xdots),     dtype=torch.float32),
+        torch.tensor(np.concatenate(xdot_vars), dtype=torch.float32),
+    )
