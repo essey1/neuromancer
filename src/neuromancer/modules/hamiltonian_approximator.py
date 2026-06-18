@@ -133,7 +133,7 @@ class HamiltonianApproximator(nn.Module):
         # .d (polynomial) and .coeffs (kernel part); we only need .coeffs for
         # the kernel term since we recompute the polynomial separately.
         self._torch_w = torch.tensor(
-            self._scipy_rbf.coeffs, dtype=x.dtype
+            self._scipy_rbf._coeffs, dtype=x.dtype
         )
 
     @staticmethod
