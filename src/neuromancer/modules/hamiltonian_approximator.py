@@ -57,7 +57,7 @@ class HamiltonianApproximator(nn.Module):
         method:      str             = 'spline',
         lengthscale: torch.Tensor    = None,
         signal_var:  torch.Tensor    = None,
-        noise:       float           = 1e-4,
+        noise:       float           = 0.0,
     ):
         super().__init__()
 
@@ -118,23 +118,20 @@ class HamiltonianApproximator(nn.Module):
 
     # ── thin-plate spline ──────────────────────────────────────────────────────
 
-    def _fit_spline(self, x: torch.Tensor, H_vals: torch.Tensor):
-        x_np  = x.detach().cpu().numpy()
-        H_np  = H_vals.detach().cpu().numpy()
-
-        # scipy handles all the kernel setup and linear solve for us.
+    def _fit_spline(self, x, H_vals):
+        x_np = x.detach().cpu().numpy()
+        H_np = H_vals.detach().cpu().numpy()
         self._scipy_rbf = RBFInterpolator(
-            x_np, H_np, kernel='thin_plate_spline'
+            x_np, H_np, kernel='thin_plate_spline', degree=-1
         )
+        self._torch_w = torch.tensor(self._scipy_rbf._coeffs, dtype=x.dtype)  # (M, 1)
 
-        # Mirror the solved weights into torch so autograd can differentiate
-        # through the same kernel at query time (scipy weights are not
-        # differentiable). RBFInterpolator stores the solved coefficients in
-        # .d (polynomial) and .coeffs (kernel part); we only need .coeffs for
-        # the kernel term since we recompute the polynomial separately.
-        self._torch_w = torch.tensor(
-            self._scipy_rbf._coeffs, dtype=x.dtype
-        )
+    def _torch_spline_eval(self, x):
+        x_c  = self._x_fit.to(x.device)
+        diff = x[:, None, :] - x_c[None, :, :]        # (K, M, nx)
+        r2   = (diff ** 2).sum(dim=-1)                  # (K, M)
+        Phi  = self._tps_basis(r2)                      # (K, M)
+        return (Phi @ self._torch_w.to(x.device)).squeeze(-1)  # (K,)
 
     @staticmethod
     def _tps_basis(r2: torch.Tensor) -> torch.Tensor:
@@ -142,16 +139,6 @@ class HamiltonianApproximator(nn.Module):
         safe = r2.clamp(min=1e-12)   # avoids log(0)
         return 0.5 * r2 * torch.log(safe)
 
-    def _torch_spline_eval(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Differentiable torch reimplementation of the fitted thin-plate spline.
-        Matches scipy output closely; used only for autograd.
-        """
-        x_c  = self._x_fit.to(x.device)
-        diff = x[:, None, :] - x_c[None, :, :]        # (K, M, nx)
-        r2   = (diff ** 2).sum(dim=-1)                 # (K, M)
-        Phi  = self._tps_basis(r2)                     # (K, M)
-        return Phi @ self._torch_w.to(x.device)        # (K,)
 
     def _eval_spline(self, x: torch.Tensor) -> torch.Tensor:
         """Use scipy for accurate evaluation (no polynomial drop)."""
@@ -180,16 +167,28 @@ class HamiltonianApproximator(nn.Module):
         return self.signal_var * torch.exp(-0.5 * (delta ** 2).sum(-1))
 
     def _fit_gp(self, x: torch.Tensor, H_vals: torch.Tensor):
-        """
-        Compute dual coefficients α = (K + σ²_n I)⁻¹ H via Cholesky.
-        This is the standard GP posterior mean weight vector.
-        """
         M = len(x)
-        K = self._k_se(x, x) + self.noise * torch.eye(M, dtype=x.dtype, device=x.device)
-        L = torch.linalg.cholesky(K)                         # lower triangular
+        K = self._k_se(x, x)
+        I = torch.eye(M, dtype=x.dtype, device=x.device)
+
+        # Scale jitter relative to the kernel's own magnitude (signal_var), not an
+        # absolute constant — a fixed 1e-10 means nothing if signal_var is large
+        # or tiny. This is standard practice (e.g. GPyTorch, GPflow).
+        base_jitter = 1e-6 * self.signal_var.item()
+        jitter = base_jitter
+        max_tries = 7
+        for attempt in range(max_tries):
+            try:
+                L = torch.linalg.cholesky(K + (self.noise + jitter) * I)
+                break
+            except RuntimeError:
+                jitter *= 10
+        else:
+            raise RuntimeError("Cholesky failed even after jitter escalation")
+
         self._alpha = torch.cholesky_solve(
-            H_vals.detach().unsqueeze(-1), L                  # (M, 1)
-        ).squeeze(-1)                                          # (M,)
+            H_vals.detach().unsqueeze(-1), L
+        ).squeeze(-1)                 
 
     def _eval_gp(self, x: torch.Tensor) -> torch.Tensor:
         """H*(x) = k(x, X_fit) · α  →  (K,)"""
