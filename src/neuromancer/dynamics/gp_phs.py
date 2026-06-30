@@ -29,7 +29,7 @@ import gpytorch
 from gpytorch.kernels import Kernel
 from linear_operator.operators import DenseLinearOperator
 import dis
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
@@ -38,48 +38,33 @@ from neuromancer.dynamics.ode import PHSODE
 
 Entry = Callable[[torch.Tensor], torch.Tensor]
 
-
-
-# Maps id(raw) -> (raw, name, recovery_fn)
-_PARAM_REGISTRY: Dict[int, Tuple[nn.Parameter, str, callable]] = {}
-
-def positive_param(name: str, init_value: float = 1.0) -> nn.Parameter:
-    assert init_value > 0
-    raw = nn.Parameter(torch.tensor(math.log(init_value)))
-    _PARAM_REGISTRY[id(raw)] = (raw, name, torch.exp)
-    return raw
-
-def nonneg_param(name: str, init_value: float = 0.5) -> nn.Parameter:
-    assert init_value >= 0
-    raw_init = math.log(math.expm1(init_value)) if init_value > 0 else -math.log(2)
-    raw = nn.Parameter(torch.tensor(raw_init))
-    _PARAM_REGISTRY[id(raw)] = (raw, name, F.softplus)
-    return raw
-
-def recover(raw: nn.Parameter) -> torch.Tensor:
-    entry = _PARAM_REGISTRY.get(id(raw))
-    if entry is None:
-        raise KeyError("Parameter not registered — use positive_param() or nonneg_param()")
-    _, _, fn = entry
-    return fn(raw)
-
-def param_table(param_map: Dict[str, Tuple[nn.Parameter, float]]) -> "pd.DataFrame":
+def param_table(param_map: Dict[str, Tuple[nn.Parameter, Optional[float]]]) -> "pd.DataFrame":
     import pandas as pd
     rows = []
-    for display_name, (raw, true_val) in param_map.items():
-        learned = recover(raw).detach().item()
-        rows.append({
-            'Parameter':   display_name,
-            'True':        true_val,
-            'Learned':     learned,
-            'Rel. Error %': 100 * abs(learned - true_val) / (abs(true_val) + 1e-6)
-        })
+    for display_name, (param, true_val) in param_map.items():
+        learned = param.value.detach().item()
+        if true_val is None:
+            rows.append({
+                'Parameter':    display_name,
+                'True':         None,
+                'Learned':      learned,
+                'Rel. Error %': None
+            })
+        else:
+            rel_err = 100 * abs(learned - true_val) / (abs(true_val) + 1e-6)
+            rows.append({
+                'Parameter':    display_name,
+                'True':         true_val,
+                'Learned':      learned,
+                'Rel. Error %': rel_err
+            })
     df = pd.DataFrame(rows)
     print(df.to_string(index=False))
-    print(f'\nMean relative error:   {df["Rel. Error %"].mean():.2f}%')
-    print(f'Median relative error: {df["Rel. Error %"].median():.2f}%')
+    errs = df['Rel. Error %'].dropna()
+    if len(errs) > 0:
+        print(f'\nMean relative error:   {errs.mean():.2f}%')
+        print(f'Median relative error: {errs.median():.2f}%')
     return df
-
 # ---------------------------------------------------------------------------
 # Helper: extract nn.Parameters from a callable's closure
 # ---------------------------------------------------------------------------
@@ -252,6 +237,12 @@ class PHSMatrices(nn.Module):
         d = torch.zeros(batch, self.nx, dtype=x.dtype, device=x.device)
         for i, fn in self._R_diag.items():
             d[:, i] = fn(x)
+        if torch.any(d < 0):
+            raise ValueError(
+                f"R diagonal has negative entries — R is not Positive Semi-Definite. "
+                f"Ensure R_diag lambdas return nonneg values for all x in your domain. "
+                f"Negative entries found at indices: {(d < 0).nonzero(as_tuple=False).tolist()}"
+            )
         return torch.diag_embed(d)
 
     def get_G(self, x: torch.Tensor) -> torch.Tensor:
@@ -464,27 +455,18 @@ class GPPHSModel(nn.Module):
     outputs, so the noise shape conflicts. NLML is computed in GPPHSLoss.
 
     Args:
-        train_x    : (N, nx)  — kept for API compatibility, not stored
-        train_u    : (N, nu)  — kept for API compatibility, not stored
-        train_xdot : (N·nx,) — kept for API compatibility, not stored
-        likelihood : gpytorch.likelihoods.GaussianLikelihood instance
         phs_matrices : PHSMatrices instance
         nx           : state dimension
         nu           : input dimension
 
     Usage:
-        model = GPPHSModel(train_x, train_u, train_xdot,
-                           likelihood, phs_matrices, nx, nu)
+        model = GPPHSModel(phs_matrices, nx, nu)
 
         pred = model(x, u)   # MultivariateNormal, mean (N·nx,), covar (N·nx, N·nx)
     """
 
     def __init__(
         self,
-        train_x:    torch.Tensor,
-        train_u:    torch.Tensor,
-        train_xdot: torch.Tensor,
-        likelihood,
         phs_matrices,
         nx: int,
         nu: int,
@@ -514,7 +496,6 @@ class GPPHSModel(nn.Module):
         # kernel intentionally returns (N·nx, N·nx).
         covar = self.covar_module.forward(x, x)  # (N·nx, N·nx)
         return gpytorch.distributions.MultivariateNormal(mean, covar)
-
 
 # ---------------------------------------------------------------------------
 # Component 5 — GPPosterior
@@ -843,8 +824,7 @@ class GPPHSNode(nn.Module):
             "raw_noise",
             gpytorch.constraints.GreaterThan(1e-4)
         )
-        # dummy inputs — GPPHSModel does not store train data, so this is safe
-        self.gp_model   = GPPHSModel(None, None, None, self.likelihood, self.phs, nx, nu)
+        self.gp_model = GPPHSModel(self.phs, nx, nu)
         self._loss_fn   = None
 
     def forward(
