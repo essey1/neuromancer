@@ -256,146 +256,62 @@ def pltGPSmooth(
     sigs=None,
     state_lbls=None,
     deriv_lbls=None,
-    figname=None,
 ):
     """
     Plot GP smoothing results: noisy vs smoothed states and estimated derivatives.
-
-    If x_trues, dynamics, and sigs are provided, true states and true
-    derivatives are also shown.
-
-    Args:
-        t_all      : list of (T,) time arrays
-        trajs      : list of (T, nx) noisy state arrays
-        smoothed   : list of (T, nx) GP-smoothed state arrays
-        xdots      : list of (T, nx) derivative mean estimates
-        xdot_vars  : list of (T, nx) derivative variances
-        x_trues    : list of (T, nx) true state arrays (optional)
-        dynamics   : callable(x, t, sig) -> xdot (optional)
-        sigs       : list of input signal callables (optional)
-        state_lbls : state labels
-        deriv_lbls : derivative labels
-        figname    : optional save path
+    One figure is created for each trajectory.
     """
     nx = trajs[0].shape[1]
-    n_traj = len(t_all)
     colors = get_colors(nx)
 
     if state_lbls is None:
         state_lbls = [f'$x_{{{d+1}}}$' for d in range(nx)]
-
     if deriv_lbls is None:
         deriv_lbls = [f'$\\dot{{x}}_{{{d+1}}}$' for d in range(nx)]
 
-    fig, axes = plt.subplots(
-        nx,
-        2 * n_traj,
-        figsize=(6 * n_traj, 3 * nx),
-        squeeze=False,
-    )
+    for i, (t_i, x_i, x_s, xd, xdv) in enumerate(zip(t_all, trajs, smoothed, xdots, xdot_vars)):
 
-    for i, (t_i, x_i, x_s, xd, xdv) in enumerate(
-        zip(t_all, trajs, smoothed, xdots, xdot_vars)
-    ):
+        fig, axes = plt.subplots(nx, 2, figsize=(12, 3 * nx), squeeze=False)
 
         xdot_true = None
+        if x_trues is not None and dynamics is not None and sigs is not None:
+            xdot_true = np.array([dynamics(x, t, sigs[i]) for x, t in zip(x_trues[i], t_i)])
 
-        if (
-            x_trues is not None
-            and dynamics is not None
-            and sigs is not None
-        ):
-            xdot_true = np.array([
-                dynamics(x, t, sigs[i])
-                for x, t in zip(x_trues[i], t_i)
-            ])
-
-        for d, (lbl, dlbl, col) in enumerate(
-            zip(state_lbls, deriv_lbls, colors)
-        ):
-
-            ax_s = axes[d, 2 * i]
-            ax_d = axes[d, 2 * i + 1]
+        for d, (lbl, dlbl, col) in enumerate(zip(state_lbls, deriv_lbls, colors)):
+            ax_s, ax_d = axes[d]
 
             # States
-            ax_s.scatter(
-                t_i,
-                x_i[:, d],
-                c=[col],
-                s=12,
-                alpha=0.4,
-                label='noisy',
-            )
-
-            ax_s.plot(
-                t_i,
-                x_s[:, d],
-                color=col,
-                label='smoothed',
-            )
-
+            ax_s.scatter(t_i, x_i[:, d], c=[col], s=12, alpha=0.4, label='noisy')
+            ax_s.plot(t_i, x_s[:, d], color=col, label='smoothed')
             if x_trues is not None:
-                ax_s.plot(
-                    t_i,
-                    x_trues[i][:, d],
-                    'k--',
-                    lw=1,
-                    label='true',
-                )
+                ax_s.plot(t_i, x_trues[i][:, d], 'k--', lw=1, label='true')
 
             ax_s.set_ylabel(lbl)
             ax_s.grid(True)
             ax_s.legend(fontsize=7)
-
             if d == 0:
                 ax_s.set_title(f'Trajectory {i+1} - States')
-
             if d == nx - 1:
                 ax_s.set_xlabel('Time (s)')
 
             # Derivatives
             std = np.sqrt(xdv[:, d])
-
-            ax_d.fill_between(
-                t_i,
-                xd[:, d] - 2 * std,
-                xd[:, d] + 2 * std,
-                alpha=0.2,
-                color=col,
-            )
-
-            ax_d.plot(
-                t_i,
-                xd[:, d],
-                color=col,
-                label='estimated',
-            )
-
+            ax_d.fill_between(t_i, xd[:, d] - 2*std, xd[:, d] + 2*std,
+                              color=col, alpha=0.2)
+            ax_d.plot(t_i, xd[:, d], color=col, label='estimated')
             if xdot_true is not None:
-                ax_d.plot(
-                    t_i,
-                    xdot_true[:, d],
-                    'k--',
-                    lw=1,
-                    label='true',
-                )
+                ax_d.plot(t_i, xdot_true[:, d], 'k--', lw=1, label='true')
 
             ax_d.set_ylabel(dlbl)
             ax_d.grid(True)
             ax_d.legend(fontsize=7)
-
             if d == 0:
                 ax_d.set_title(f'Trajectory {i+1} - Derivatives')
-
             if d == nx - 1:
                 ax_d.set_xlabel('Time (s)')
 
-    plt.tight_layout()
-
-    if figname is not None:
-        plt.savefig(figname)
-
-    plt.show()
+        plt.tight_layout()
+        plt.show()
 
 def pltHamiltonian(H_mean, H_var, H_true=None, figname=None):
     """
@@ -425,8 +341,6 @@ def pltHamiltonian(H_mean, H_var, H_true=None, figname=None):
     ax.legend(fontsize=8)
     ax.grid(True)
     plt.tight_layout()
-    if figname is not None:
-        plt.savefig(figname)
     plt.show()
 
 def pltXdot(xdot_pred, xdot_true=None, xdot_std=None, state_lbls=None, figname=None):
@@ -447,7 +361,7 @@ def pltXdot(xdot_pred, xdot_true=None, xdot_std=None, state_lbls=None, figname=N
     if state_lbls is None:
         state_lbls = [f'$\\dot{{x}}_{{{d+1}}}$' for d in range(nx)]
 
-    fig, axes = plt.subplots(1, nx, figsize=(4 * nx, 4))
+    fig, axes = plt.subplots(nx, 1, figsize=(8, 3.5 * nx))
     if nx == 1:
         axes = [axes]
 
@@ -467,9 +381,7 @@ def pltXdot(xdot_pred, xdot_true=None, xdot_std=None, state_lbls=None, figname=N
         axes[d].grid(True)
 
     plt.suptitle('Pointwise derivative prediction at training points')
-    plt.tight_layout()
-    if figname is not None:
-        plt.savefcall(figname)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
 
 def pltTrajectory(t, x_pred, x_true=None, std=None, state_lbls=None, figname=None):
@@ -499,7 +411,5 @@ def pltTrajectory(t, x_pred, x_true=None, std=None, state_lbls=None, figname=Non
     axes[0].set_title('GP-PHS Trajectory Rollout')
     axes[-1].set_xlabel('time (s)')
     plt.tight_layout()
-    if figname is not None:
-        plt.savefig(figname)
     plt.show()
 
