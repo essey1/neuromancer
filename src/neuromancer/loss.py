@@ -429,7 +429,6 @@ class GPPHSLoss(nn.Module):
 losses = {'penalty': PenaltyLoss,
           'barrier': BarrierLoss,
           'augmented_lagrange': AugmentedLagrangeLoss,
-        #   'gp_phs': GPPHSLoss,
         }
 
 def get_loss(objectives, constraints, train_data, args):
@@ -443,6 +442,3 @@ def get_loss(objectives, constraints, train_data, args):
                           'mu_init': args.mu_init, "mu_max": args.mu_max}
         loss = AugmentedLagrangeLoss(objectives, constraints, train_data, **optimizer_args)
     return loss
-
-# def get_gpphs_loss(model, likelihood):
-#     return GPPHSLoss(model, likelihood)
