@@ -668,9 +668,10 @@ class PHSODE(ODESystem):
         t0, tf = t_span
 
         if t_eval is None:
-            t_eval = torch.arange(
-                t0, tf + dt, dt,
-                dtype=x0.dtype, device=x0.device
+            # avoid float rounding issues in torch.arange's upper bound
+            n_steps = int(round((tf - t0) / dt))
+            t_eval = t0 + dt * torch.arange(
+                n_steps + 1, dtype=x0.dtype, device=x0.device
             )
 
         # simulate one trajectory per H* sample
@@ -679,12 +680,11 @@ class PHSODE(ODESystem):
             traj = self._simulate_single(x0, t_eval, u, ham)  # (T, batch, nx)
             all_trajs.append(traj)
 
-        # stack over ensemble dimension : (S, T, batch, nx)
-        samples = torch.stack(all_trajs, dim=0)
+        samples = torch.stack(all_trajs, dim=0)  # (S, T, batch, nx)
+        mean = samples.mean(dim=0)
 
-        # mean and std over ensemble
-        mean = samples.mean(dim=0)                             # (T, batch, nx)
-        std  = samples.std(dim=0)                              # (T, batch, nx)
+        # std() is unbiased (n-1) by default -> NaN when S=1
+        std = samples.std(dim=0) if samples.shape[0] > 1 else torch.zeros_like(mean)
 
         return {
             'mean':   mean,
