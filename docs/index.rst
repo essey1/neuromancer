@@ -319,6 +319,7 @@ Documentation
    solvers.rst
    simulator.rst
    physics.rst
+   gp_phs.rst
 
    psl/index.rst
    slim/index.rst
