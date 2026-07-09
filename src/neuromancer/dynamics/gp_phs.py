@@ -1,23 +1,20 @@
 """
 gp_phs.py
 =========
-Component 1 — PHSMatrices : structural definition of J, R, G
-Component 2 — PHSKernel   : physics-structured GP covariance
-Component 3 — PHSMeanFunction : GP prior mean m(x, u) = G(x) · u
-Component 4 — GPPHSModel      : full GP model combining mean + kernel
-
-Port-Hamiltonian System:
-    ẋ = (J(x) - R(x)) · ∇H  +  G(x) · u
-
-Kernel:
-    k_phs(x, x') = σ²f · (J(x)-R(x)) · H_rbf(x,x') · (J(x')-R(x'))ᵀ
-
-    H_rbf(x,x')ᵢⱼ = k_rbf(x,x') · [Λ⁻¹ᵢⱼ - (Λ⁻¹δ)ᵢ · (Λ⁻¹δ)ⱼ]
-    δ = x - x'
-
-Entry signature for all matrices (J, R, G):
-    callable(x: Tensor) -> Tensor of shape (batch,)
+Component 1 — PHSMatrices
+    Structural definition of the Port-Hamiltonian matrices J(x), R(x), and G(x).
+Component 2 — PHSKernel
+    Physics-informed Gaussian Process covariance derived from the Port-Hamiltonian dynamics.
+Component 3 — PHSMeanFunction
+    GP prior mean
+Component 4 — GPPHSModel
+    Defines the GP prior over state derivatives by combining the physics-informed mean and covariance.
+Component 5 — GPPosterior
+    Computes the posterior distribution of the Hamiltonian H(x) from the learned GP over state derivatives and provides posterior sampling.
+Component 6 — GPPHSNode
+    Neuromancer-compatible wrapper that trains the GP-PHS model by minimizing the negative log marginal likelihood (NLML) and exposes the learned posterior.
 """
+
 
 from __future__ import annotations
 
@@ -36,8 +33,10 @@ from dataclasses import dataclass
 
 from neuromancer.dynamics.ode import PHSODE
 
+# Type alias: callable mapping a batch of states to a batch of scalar values
 Entry = Callable[[torch.Tensor], torch.Tensor]
 
+# Display learned parameters alongside their true values and relative errors
 def param_table(param_map: Dict[str, Tuple[nn.Parameter, Optional[float]]]) -> "pd.DataFrame":
     import pandas as pd
     rows = []
@@ -65,9 +64,6 @@ def param_table(param_map: Dict[str, Tuple[nn.Parameter, Optional[float]]]) -> "
         print(f'\nMean relative error:   {errs.mean():.2f}%')
         print(f'Median relative error: {errs.median():.2f}%')
     return df
-# ---------------------------------------------------------------------------
-# Helper: extract nn.Parameters from a callable's closure
-# ---------------------------------------------------------------------------
 
 def _extract_closure_parameters(fn) -> Dict[str, nn.Parameter]:
     """
@@ -112,18 +108,14 @@ def _extract_closure_parameters(fn) -> Dict[str, nn.Parameter]:
 
     return params
 
-
 # ---------------------------------------------------------------------------
 # Component 1 — PHSMatrices
 # ---------------------------------------------------------------------------
-
 class PHSMatrices(nn.Module):
     """
     Structural definition of the PHS matrices J, R, G.
-
     All three matrices are functions of state x only.
     Control input u is applied externally: ẋ = (J-R)∇H + G·u
-
     Args:
         nx          : state dimension
         nu          : input dimension (needed to size G)
@@ -135,32 +127,7 @@ class PHSMatrices(nn.Module):
                       PSD enforced: R = diag(d²)
         G_full      : full (nx, nu) entries of G
                       dict[(i,j)] -> callable(x) -> (batch,)
-
-    Example
-    -------
-        w = nn.Parameter(torch.tensor(1.0))
-
-        phs = PHSMatrices(
-            nx=3, nu=2,
-            J_upper={
-                (0, 1): lambda x: torch.ones(x.shape[0]),
-                (0, 2): lambda x: x[:, 1],
-                (1, 2): lambda x: w * torch.sin(x[:, 0]),  # w is auto-detected
-            },
-            R_diag={
-                0: lambda x: torch.ones(x.shape[0]) * 0.5,
-                1: lambda x: x[:, 2].abs(),
-                2: lambda x: torch.ones(x.shape[0]) * 0.1,
-            },
-            G_full={
-                (0, 0): lambda x: torch.ones(x.shape[0]),
-                (2, 1): lambda x: x[:, 0],
-            },
-        )
-
-        J, R, G = phs(x)
     """
-
     def __init__(
         self,
         nx: int,
@@ -176,24 +143,24 @@ class PHSMatrices(nn.Module):
         self._R_diag  = R_diag
         self._G_full  = G_full
 
-        # ── validate indices ───────────────────────────────────────────────
+        # validate indices
         for (i, j) in J_upper:
             if not (0 <= i < j < nx):
                 raise ValueError(
-                    f"J_upper key ({i},{j}) invalid — need 0 <= i < j < nx={nx}"
+                    f"J_upper key ({i},{j}) invalid: need 0 <= i < j < nx={nx}"
                 )
         for i in R_diag:
             if not (0 <= i < nx):
                 raise ValueError(
-                    f"R_diag key {i} invalid — need 0 <= i < nx={nx}"
+                    f"R_diag key {i} invalid: need 0 <= i < nx={nx}"
                 )
         for (i, j) in G_full:
             if not (0 <= i < nx and 0 <= j < nu):
                 raise ValueError(
-                    f"G_full key ({i},{j}) invalid — need i < nx={nx}, j < nu={nu}"
+                    f"G_full key ({i},{j}) invalid: need i < nx={nx}, j < nu={nu}"
                 )
 
-        # ── warn on incomplete R diagonal ──────────────────────────────────
+        # warn on incomplete R diagonal
         missing = [i for i in range(nx) if i not in R_diag]
         if missing:
             import warnings
@@ -203,7 +170,7 @@ class PHSMatrices(nn.Module):
                 stacklevel=2,
             )
 
-        # ── register parameters found in closures ──────────────────────────
+        # register parameters found in closures
         for tag, entries in [
             ("J", {f"{i}_{j}": fn for (i, j), fn in J_upper.items()}),
             ("R", {f"{i}":     fn for i,       fn in R_diag.items()}),
@@ -215,8 +182,7 @@ class PHSMatrices(nn.Module):
                     if reg not in dict(self.named_parameters()):
                         self.register_parameter(reg, param)
 
-    # ── matrix constructors ────────────────────────────────────────────────
-
+    # matrix constructors
     def get_J(self, x: torch.Tensor) -> torch.Tensor:
         """
         Returns skew-symmetric J of shape (batch, nx, nx).
@@ -230,19 +196,14 @@ class PHSMatrices(nn.Module):
 
     def get_R(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Returns PSD R of shape (batch, nx, nx).
-        User supplies diagonal d; R = diag(d²) guarantees R >= 0.
+        Returns the diagonal dissipation matrix R of shape (batch, nx, nx).
+        The user specifies the diagonal entries directly. Nonnegative
+        diagonal entries are required to ensure R is positive semi-definite.
         """
         batch = x.shape[0]
         d = torch.zeros(batch, self.nx, dtype=x.dtype, device=x.device)
         for i, fn in self._R_diag.items():
-            d[:, i] = fn(x)
-        if torch.any(d < 0):
-            raise ValueError(
-                f"R diagonal has negative entries — R is not Positive Semi-Definite. "
-                f"Ensure R_diag lambdas return nonneg values for all x in your domain. "
-                f"Negative entries found at indices: {(d < 0).nonzero(as_tuple=False).tolist()}"
-            )
+            d[:, i] = fn(x).clamp_min(0.0)
         return torch.diag_embed(d)
 
     def get_G(self, x: torch.Tensor) -> torch.Tensor:
@@ -267,22 +228,17 @@ class PHSMatrices(nn.Module):
 # ---------------------------------------------------------------------------
 # Component 2 — PHSKernel
 # ---------------------------------------------------------------------------
-
 class PHSKernel(Kernel):
     """
     Port-Hamiltonian System kernel for GPyTorch.
-
     k_phs(x, x') = σ²f · (J(x)-R(x)) · H_rbf(x,x') · (J(x')-R(x'))ᵀ
-
     Args:
         phs_matrices : PHSMatrices instance — provides get_J(x), get_R(x)
         nx           : state dimension
-
     Learnable parameters:
         raw_lengthscale : (nx,)  diagonal of Λ, constrained positive via softplus
         raw_signal_var  : ()     σ²f, constrained positive via softplus
     """
-
     is_stationary = False
 
     def __init__(self, phs_matrices: PHSMatrices, nx: int, **kwargs):
@@ -316,15 +272,7 @@ class PHSKernel(Kernel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute scalar RBF values and their nx×nx Hessian blocks
-        for all (N, M) pairs. Fully vectorised — no loops.
-
-        Args:
-            x1 : (N, nx)
-            x2 : (M, nx)
-
-        Returns:
-            k_rbf : (N, M)
-            H     : (N, M, nx, nx)
+        for all (N, M) pairs. Fully vectorised, no loops.
         """
         inv_lambda  = 1.0 / self.lengthscale           # (nx,)
         inv_lambda2 = inv_lambda ** 2                  # (nx,)
@@ -353,11 +301,9 @@ class PHSKernel(Kernel):
     ) -> DenseLinearOperator:
         """
         Compute the full PHS kernel matrix.
-
         Args:
             x1 : (N, nx)
             x2 : (M, nx)
-
         Returns:
             DenseLinearOperator of shape (N·nx, M·nx)
         """
@@ -393,25 +339,17 @@ class PHSKernel(Kernel):
 # ---------------------------------------------------------------------------
 # Component 3 — PHSMeanFunction
 # ---------------------------------------------------------------------------
-
 class PHSMeanFunction(gpytorch.means.Mean):
     """
     Prior mean function for the PHS GP model.
-
     Computes m(x, u) = G(x) · u for each data point.
-
-    This class expects x and u to be passed separately — concatenation
-    and splitting is handled by GPPHSModel.forward, not here.
-
     Args:
         phs_matrices : PHSMatrices instance — provides get_G(x)
         nx           : state dimension
         nu           : input dimension
-
     Input:
         x : (N, nx)
         u : (N, nu)
-
     Output:
         (N·nx,) — flattened mean vector
     """
@@ -438,31 +376,15 @@ class PHSMeanFunction(gpytorch.means.Mean):
 # ---------------------------------------------------------------------------
 # Component 4 — GPPHSModel
 # ---------------------------------------------------------------------------
-
 class GPPHSModel(nn.Module):
     """
     Full GP model for Port-Hamiltonian dynamics.
-
     GP prior:
         ẋ ~ GP(G(x)u, k_phs(x, x'))
-
-    x and u are always passed separately.
-    The kernel receives x only (k_phs is a function of x alone).
-    The mean receives x and u separately (m = G(x)·u needs both).
-
-    Note: does NOT inherit from ExactGP. GPyTorch's ExactGP assumes
-    N inputs → N scalar outputs, but PHS has N inputs → N·nx vector
-    outputs, so the noise shape conflicts. NLML is computed in GPPHSLoss.
-
     Args:
         phs_matrices : PHSMatrices instance
         nx           : state dimension
         nu           : input dimension
-
-    Usage:
-        model = GPPHSModel(phs_matrices, nx, nu)
-
-        pred = model(x, u)   # MultivariateNormal, mean (N·nx,), covar (N·nx, N·nx)
     """
 
     def __init__(
@@ -484,7 +406,6 @@ class GPPHSModel(nn.Module):
         Args:
             x : (N, nx) — state
             u : (N, nu) — control input
-
         Returns:
             MultivariateNormal with
                 mean  : (N·nx,)
@@ -500,18 +421,14 @@ class GPPHSModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Component 5 — GPPosterior
 # ---------------------------------------------------------------------------
-
 class GPPosterior(nn.Module):
     """
     GP posterior for Port-Hamiltonian dynamics.
-
-    Forms the joint distribution over [Ẋ, H(x*)] from equation (14):
-
+    Forms the joint distribution over [Ẋ, H(x*)]:
         [Ẋ       ]       [K_phs            k_ẋH(X, x*)  ]
         [H(x*)]  ~ N(0,  [k_ẋH(X,x*)ᵀ     k_HH(x*, x*) ])
 
     Conditions on training Ẋ to obtain posterior over H(x*):
-
         μ_H = k_ẋH(X,x*)ᵀ · (K_phs + Δ)⁻¹ · Ẋ
         Σ_H = k_HH(x*,x*) - k_ẋH(X,x*)ᵀ · (K_phs + Δ)⁻¹ · k_ẋH(X,x*)
 
@@ -525,13 +442,6 @@ class GPPosterior(nn.Module):
         lengthscale  : (nx,)  learned Λ diagonal
         signal_var   : ()     learned σ_f
         noise_var    : ()     learned noise variance
-
-    Usage:
-        learned  = problem.train(train_x, train_u, train_xdot)
-        posterior = GPPosterior(**learned)
-
-        # get posterior over H at test points
-        H_mean, H_var, H_samples = posterior(train_x, train_xdot, test_x)
     """
 
     def __init__(
@@ -557,8 +467,7 @@ class GPPosterior(nn.Module):
         self.model.eval()
         self.likelihood.eval()
 
-    # ── kernel helpers ─────────────────────────────────────────────────────
-
+    # kernel helpers
     def _k_HH(
         self,
         x1: torch.Tensor,
@@ -566,13 +475,10 @@ class GPPosterior(nn.Module):
     ) -> torch.Tensor:
         """
         Scalar RBF kernel between H values.
-
             k_HH(x, x') = σ²f · exp(-0.5·||x-x'||²_Λ)
-
         Args:
             x1 : (N, nx)
             x2 : (M, nx)
-
         Returns:
             (N, M)
         """
@@ -588,19 +494,14 @@ class GPPosterior(nn.Module):
     ) -> torch.Tensor:
         """
         Cross-kernel between ẋ at training points and H at test points.
-
             k_ẋH(x, x') = (J(x)-R(x)) · ∇_x k_HH(x, x')
-
         where:
             ∇_x k_HH(x,x') = k_HH(x,x') · (-Λ⁻¹(x-x'))
-
         so:
             k_ẋH(x,x') = σ²f · (J-R)(x) · (-Λ⁻¹(x-x')) · exp(-||x-x'||²_Λ)
-
         Args:
             x_train : (N, nx)  training states
             x_test  : (M, nx)  test states
-
         Returns:
             (N·nx, M)  — one nx-vector per training point per test point
         """
@@ -631,8 +532,7 @@ class GPPosterior(nn.Module):
         # reshape to (N·nx, M)
         return k_xdotH.permute(0, 2, 1).reshape(N * nx, M)
 
-    # ── posterior over H ───────────────────────────────────────────────────
-
+    # posterior over H
     def _get_K_phs_plus_noise(
         self,
         x_train:  torch.Tensor,
@@ -641,7 +541,6 @@ class GPPosterior(nn.Module):
     ) -> torch.Tensor:
         """
         Returns K_phs + Δ  of shape (N·nx, N·nx).
-
         Δ is the derivative noise matrix:
             - If xdot_var (N, nx) is given: Δ = diag(xdot_var.flatten())
               — uses per-point variances from the GP smoother (paper-correct).
@@ -667,19 +566,17 @@ class GPPosterior(nn.Module):
         train_u:    torch.Tensor,
         train_xdot: torch.Tensor,
         test_x:     torch.Tensor,
-        n_samples:  int = 10,
+        n_samples:  int = 20,
         xdot_var:   torch.Tensor = None,
     ):
         """
         Compute posterior over H(x*) conditioned on training Ẋ.
-
         Args:
             train_x    : (N, nx)   training states
             train_u    : (N, nu)   training control inputs
             train_xdot : (N, nx)   training state derivatives
             test_x     : (M, nx)   test states to sample H at
             n_samples  : number of H samples to draw
-
         Returns:
             H_mean    : (M,)         posterior mean of H at test points
             H_var     : (M,)         posterior variance of H at test points
@@ -690,8 +587,7 @@ class GPPosterior(nn.Module):
         nx = self.phs.nx
 
         with torch.no_grad():
-
-            # ── build cross and self kernels ───────────────────────────────
+            # build cross and self kernels
             # k_ẋH(X, x*) : (N·nx, M)
             K_xdotH = self._k_xdotH(train_x, test_x)
 
@@ -701,7 +597,7 @@ class GPPosterior(nn.Module):
             # (K_phs + Δ) : (N·nx, N·nx)
             K_noise = self._get_K_phs_plus_noise(train_x, train_u, xdot_var)
 
-            # ── solve (K_phs + Δ)⁻¹ · k_ẋH via Cholesky ──────────────────
+            # solve (K_phs + Δ)⁻¹ · k_ẋH via Cholesky
             n_k = K_noise.shape[0]
             jitter = 1e-6 * torch.eye(n_k, dtype=K_noise.dtype, device=K_noise.device)
             L = torch.linalg.cholesky(K_noise + jitter)           # (N·nx, N·nx)
@@ -721,7 +617,7 @@ class GPPosterior(nn.Module):
             # V = (K_phs + Δ)⁻¹ · k_ẋH : (N·nx, M)
             V = torch.cholesky_solve(K_xdotH, L)                  # (N·nx, M)
 
-            # ── posterior mean and covariance ──────────────────────────────
+            # posterior mean and covariance
             # μ_H = k_ẋH(X,x*)ᵀ · α : (M,)
             H_mean = K_xdotH.T @ alpha                             # (M,)
 
@@ -731,7 +627,7 @@ class GPPosterior(nn.Module):
             # clamp diagonal for numerical stability
             H_var  = H_cov.diagonal().clamp(min=0.0)               # (M,)
 
-            # ── sample from posterior ──────────────────────────────────────
+            # sample from posterior
             # H_cov is theoretically PSD but numerically indefinite due to
             # floating-point accumulation in the Schur complement. We are
             # inside torch.no_grad() so eigendecomposition is safe and cheap.
@@ -743,6 +639,7 @@ class GPPosterior(nn.Module):
             H_samples = H_mean[None, :] + (eps @ L_H.T)   # (n_samples, M)
 
         return H_mean, H_var, H_samples
+    
     def predict(
         self,
         smoothed,
@@ -750,35 +647,29 @@ class GPPosterior(nn.Module):
         xdots,
         xdot_vars,
         test_x=None,
-        n_samples=50,
+        n_samples=20,
     ):
         """
         Convenience wrapper around GPPosterior.forward().
         """
-
         train_x = torch.tensor(
             np.concatenate(smoothed),
             dtype=torch.float32,
         )
-
         train_u = torch.tensor(
             np.concatenate(us),
             dtype=torch.float32,
         )
-
         train_xdot = torch.tensor(
             np.concatenate(xdots),
             dtype=torch.float32,
         )
-
         xdot_var_t = torch.tensor(
             np.concatenate(xdot_vars),
             dtype=torch.float32,
         )
-
         if test_x is None:
             test_x = train_x
-
         return self(
             train_x=train_x,
             train_u=train_u,
@@ -792,7 +683,6 @@ class GPPosterior(nn.Module):
 # ---------------------------------------------------------------------------
 # Component 6 — GPPHSNode  (Neuromancer Node-compatible wrapper)
 # ---------------------------------------------------------------------------
-
 class GPPHSNode(nn.Module):
     """
     Node-compatible wrapper that integrates GPPHSModel into Neuromancer's
@@ -805,7 +695,6 @@ class GPPHSNode(nn.Module):
     ``Problem.parameters()`` and the optimizer.
 
     Usage::
-
         gpphs_module = GPPHSNode(phs, nx=2, nu=1)
         gpphs_node   = Node(gpphs_module,
                             ['X', 'U', 'Xdot', 'Xdot_var'], ['nlml'],

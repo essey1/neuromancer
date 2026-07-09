@@ -464,10 +464,8 @@ class CSTR_Param(ODESystem):
 class PHSODE(ODESystem):
     """
     Port-Hamiltonian System ODE for trajectory generation.
-
     Implements:
         ẋ = (J(x) - R(x)) · ∇H*(x) + G(x) · u
-
     where:
         J(x), R(x), G(x) — learned PHS matrices from PHSMatrices
         ∇H*(x)           — gradient of approximated Hamiltonian
@@ -485,22 +483,6 @@ class PHSODE(ODESystem):
         nu           : input dimension
         method       : torchdiffeq solver ('dopri5', 'rk4', 'euler')
                        default 'dopri5' (adaptive Runge-Kutta 4/5)
-
-    Usage:
-        # single H* — no uncertainty
-        ode = PHSODE(phs_matrices, hamiltonian, nx, nu)
-
-        # ensemble of H* — propagates uncertainty
-        ode = PHSODE(phs_matrices, hamiltonians, nx, nu)
-
-        # constant u
-        traj = ode.simulate(x0, t_span, u=u_const)
-
-        # time-varying u
-        traj = ode.simulate(x0, t_span, u=u_sequence, t_eval=t_eval)
-
-        # feedback u
-        traj = ode.simulate(x0, t_span, u=lambda x, t: controller(x))
     """
 
     def __init__(
@@ -531,12 +513,10 @@ class PHSODE(ODESystem):
     ) -> torch.Tensor:
         """
         Compute ẋ = (J(x)-R(x)) · ∇H*(x) + G(x) · u
-
         Args:
             x   : (batch, nx)
             u   : (batch, nu)
             ham : HamiltonianApproximator instance
-
         Returns:
             ẋ : (batch, nx)
         """
@@ -566,18 +546,15 @@ class PHSODE(ODESystem):
     ) -> torch.Tensor:
         """
         Resolve control input u at current state x and time t.
-
         Supports three modes:
             constant     : u is (batch, nu) tensor — same at every step
             time-varying : u is (T, batch, nu) tensor — indexed by time step
             feedback     : u is callable(x, t) -> (batch, nu)
-
         Args:
             u      : tensor (batch, nu) | tensor (T, batch, nu) | callable
             x      : (batch, nx) current state
             t      : () current time
             t_eval : (T,) time points for time-varying indexing
-
         Returns:
             u_t : (batch, nu)
         """
@@ -608,13 +585,11 @@ class PHSODE(ODESystem):
     ) -> torch.Tensor:
         """
         Simulate one trajectory using one HamiltonianApproximator.
-
         Args:
             x0     : (batch, nx)  initial state
             t_eval : (T,)         time points to evaluate at
             u      : control input — constant, time-varying, or callable
             ham    : HamiltonianApproximator instance
-
         Returns:
             trajectory : (T, batch, nx)
         """
@@ -644,10 +619,8 @@ class PHSODE(ODESystem):
     ) -> dict:
         """
         Simulate PHS trajectories over a time horizon.
-
         For ensemble mode (multiple H* samples), runs one trajectory
         per sample and returns the full distribution over trajectories.
-
         Args:
             x0     : (batch, nx)       initial state
             t_span : (t0, tf)          start and end time
@@ -657,7 +630,6 @@ class PHSODE(ODESystem):
                          callable(x, t)      — feedback, called at each step
             dt     : float             time step (used if t_eval not given)
             t_eval : (T,) optional     specific times to evaluate at
-
         Returns:
             dict with:
                 'mean'      : (T, batch, nx)  mean trajectory over ensemble
@@ -697,11 +669,9 @@ class PHSODE(ODESystem):
         """
         Single step evaluation — consistent with ODESystem interface.
         Uses the first (or only) HamiltonianApproximator.
-
         Args:
             x : (batch, nx)
             u : (batch, nu)
-
         Returns:
             ẋ : (batch, nx)
         """

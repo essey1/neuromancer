@@ -4,9 +4,7 @@ hamiltonian_approximator.py
 Approximates sampled H values from GPPosterior with a callable
 H*(x) for use in ODE solving. Preserves PHS structure by approximating
 H directly, so:
-
     ẋ = (J(x) - R(x)) · ∇H*(x) + G(x) · u
-
 remains a valid Port-Hamiltonian system.
 
 Two methods:
@@ -21,27 +19,23 @@ import torch.nn as nn
 import numpy as np
 from scipy.interpolate import RBFInterpolator
 
-
 class HamiltonianApproximator(nn.Module):
     """
     Fits H*(x) to sampled Hamiltonian values, then evaluates H* and ∇H*
     at arbitrary query points.
-
     Args:
         method      : 'spline' (default) | 'gp'
         lengthscale : (nx,) tensor — required for method='gp'
         signal_var  : scalar tensor  — required for method='gp'
-        noise       : nugget added to diagonal for GP stability (default 1e-4)
+        noise       : nugget added to diagonal for GP stability
 
     Example — spline::
-
         approx = HamiltonianApproximator(method='spline')
         approx.fit(x_train, H_samples)
         H_star  = approx(x_query)          # (K,)
         grad_H  = approx.gradient(x_query) # (K, nx)
 
     Example — GP::
-
         approx = HamiltonianApproximator(
             method='gp',
             lengthscale=model.covar_module.base_kernel.lengthscale.squeeze(),
@@ -82,12 +76,10 @@ class HamiltonianApproximator(nn.Module):
         self._torch_w    : torch.Tensor     = None  # spline: weights for autograd
         self._alpha      : torch.Tensor     = None  # gp:     dual coefficients
 
-    # ── public API ─────────────────────────────────────────────────────────────
-
+    # public API
     def fit(self, x: torch.Tensor, H_vals: torch.Tensor) -> 'HamiltonianApproximator':
         """
         Fit the approximator.
-
         Args:
             x      : (M, nx) state points used to collect H samples.
             H_vals : (M,)    sampled Hamiltonian values at those states.
@@ -116,8 +108,7 @@ class HamiltonianApproximator(nn.Module):
         else:
             return self._grad_gp(x)
 
-    # ── thin-plate spline ──────────────────────────────────────────────────────
-
+    # thin-plate spline
     def _fit_spline(self, x, H_vals):
         x_np = x.detach().cpu().numpy()
         H_np = H_vals.detach().cpu().numpy()
@@ -152,14 +143,11 @@ class HamiltonianApproximator(nn.Module):
         grad, = torch.autograd.grad(H.sum(), x_req)
         return grad  # (K, nx)
 
-    # ── GP with SE kernel ──────────────────────────────────────────────────────
-
+    # GP with SE kernel
     def _k_se(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """
         Squared-exponential kernel with ARD lengthscales.
-
             k(x1, x2) = σ²_f · exp(-½ ‖x1 - x2‖²_Λ)
-
         where Λ = diag(ℓ²). Returns (N, M).
         """
         inv_l = 1.0 / self.lengthscale                         # (nx,)

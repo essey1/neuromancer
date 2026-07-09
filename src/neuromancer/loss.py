@@ -1,12 +1,17 @@
 """
 Loss function aggregators that create physics-informed loss functions
 from the list of defined objective terms and constraints.
+It also provides probabilistic loss functions for likelihood-based learning.
 
 Currently supported loss functions:
 
+Constraint optimization losses:
 * `PenaltyLoss <https://en.wikipedia.org/wiki/Penalty_method>`_
 * `BarrierLoss <https://en.wikipedia.org/wiki/Barrier_function>`_
 * `AugmentedLagrangeLoss <https://en.wikipedia.org/wiki/Augmented_Lagrangian_method>`_
+
+Probabilistic losses:
+* GPPHSLoss
 
 """
 
@@ -347,25 +352,19 @@ class AugmentedLagrangeLoss(AggregateLoss):
 # ──────────────────────────────────────────────────────────────────────────
 # GP-PHS Loss  (does not subclass AggregateLoss — different paradigm)
 # ──────────────────────────────────────────────────────────────────────────
-
 class GPPHSLoss(nn.Module):
     """
     NLML loss for the GP-PHS model.
-
     Computes the negative marginal log-likelihood directly via Cholesky:
-
         NLML = 0.5 · rᵀ(K+σ²I)⁻¹r + 0.5 · log|K+σ²I| + const
-
     where r = ẋ_flat - μ(x,u) is the residual over all N·nx observations.
 
     GPyTorch's ExactMarginalLogLikelihood cannot be used here because
     ExactGP assumes N inputs → N scalar outputs, but PHS has N inputs →
     N·nx outputs (the noise would be (N,N) vs the kernel (N·nx, N·nx)).
-
     Args:
         model      : GPPHSModel instance
         likelihood : gpytorch.likelihoods.GaussianLikelihood instance
-
     Usage:
         loss_fn = GPPHSLoss(model, likelihood)
         loss = loss_fn(x, u, xdot)
@@ -386,14 +385,12 @@ class GPPHSLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Compute negative NLML loss.
-
         Args:
             x        : (N, nx)   state
             u        : (N, nu)   control input
             xdot     : (N·nx,) or (N, nx)  state derivatives
             xdot_var : (N, nx)   derivative variances from gp_smoother (Δ diagonal).
                        If None, falls back to likelihood.noise * I.
-
         Returns:
             scalar loss — minimizing this maximizes the marginal likelihood
         """
@@ -416,7 +413,8 @@ class GPPHSLoss(nn.Module):
 
         # Small fixed jitter for floating-point stability. The PHS kernel is
         # PSD by construction (correct mixed Hessian formula), so 1e-6 is enough.
-        jitter  = 1e-6 * torch.eye(n, dtype=K.dtype, device=K.device)
+        scale = K_noisy.diagonal().mean().clamp(min=1e-12)
+        jitter = 1e-6 * scale * torch.eye(n, dtype=K.dtype, device=K.device)
         L       = torch.linalg.cholesky(K_noisy + jitter)
         alpha   = torch.cholesky_solve(residual.unsqueeze(-1), L).squeeze(-1)
 

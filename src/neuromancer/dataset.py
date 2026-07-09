@@ -897,7 +897,7 @@ def get_static_dataloaders(data, norm_type=None, split_ratio=None, num_workers=0
     return (train_data, dev_data, test_data), train_data.dataset.dims
 
 
-def gpphs_data_from_arrays(
+def get_gpphs_dataloaders(
     x,
     x_dot,
     u=None,
