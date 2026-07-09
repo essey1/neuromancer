@@ -404,6 +404,20 @@ def pltTrajectory(t, x_pred, x_true=None, std=None, state_lbls=None, figname=Non
                                  alpha=0.2, color=col, label='±2σ')
         if x_true is not None:
             axes[d].plot(t, x_true[:, d], 'k--', lw=1, label='true')
+
+            # Short quantitative summary per state
+            err   = x_pred[:, d] - x_true[:, d]
+            rmse  = np.sqrt(np.mean(err**2))
+            rng   = x_true[:, d].max() - x_true[:, d].min()
+            nrmse = rmse / rng if rng > 1e-8 else np.nan
+            metric_str = f'RMSE={rmse:.3f}  NRMSE={nrmse:.2%}'
+            if std is not None:
+                coverage = (np.abs(err) < 2*std[:, d]).mean()
+                metric_str += f'  ±2σ cov={coverage:.0%}'
+            axes[d].text(0.99, 0.95, metric_str, transform=axes[d].transAxes,
+                         ha='right', va='top', fontsize=8,
+                         bbox=dict(boxstyle='round', fc='white', alpha=0.7))
+
         axes[d].set_ylabel(lbl)
         axes[d].legend(fontsize=8)
         axes[d].grid(True)
