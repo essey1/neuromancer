@@ -1,6 +1,21 @@
 Gaussian Process Port-Hamiltonian Systems
 =========================================
 
+Gaussian Process Port-Hamiltonian Systems (GP-PHS) combine Gaussian
+Processes with the structure of Port-Hamiltonian systems to learn
+continuous-time dynamics while preserving physical properties such as
+energy balance and passivity. GP-PHS places a Gaussian Process prior on the Hamiltonian,
+yielding probabilistic dynamics with uncertainty quantification.
+
+For further details, see the original paper:
+`Gaussian Process Port-Hamiltonian Systems: Bayesian Learning with Physics Prior <https://arxiv.org/abs/2305.09017>`_
+
+Tutorials
+---------
+
+- `Double-well Oscillator <https://colab.research.google.com/drive/12w4pyQRXxjUhxb6bU5YVedYhlVAQrmWY?usp=sharing>`_
+- `Nonlinear Controlled 2-DOF Port-Hamiltonian Oscillator <https://colab.research.google.com/drive/1loRhSxpP5xddiRRP1DSQFKsQIq9SUUKO?usp=sharing>`_
+
 .. contents:: Table of Contents
    :local:
    :depth: 2
@@ -24,7 +39,7 @@ the format required by ``GPPHSNode`` for training. It has two stages:
 
 The two stages are intentionally separate so you can substitute your
 own derivative estimates if you already have them, bypassing the GP
-smoother entirely.
+smoother.
 
 
 gp_smooth
@@ -111,14 +126,14 @@ Usage
    x_smooth, xdot_smooth, xdot_var = gp_smoother.gp_smooth(t, x_noisy)
 
 
-gpphs_data_from_arrays
-~~~~~~~~~~~~~~~~~~~~~~
+get_gpphs_dataloaders
+~~~~~~~~~~~~~~~~~~~~~
 
 **Module:** ``neuromancer.dataset``
 
 .. code:: python
 
-   gpphs_data_from_arrays(
+   get_gpphs_dataloaders(
        x:           np.ndarray,
        x_dot:       np.ndarray,
        u:           np.ndarray = None,
@@ -200,7 +215,7 @@ Usage
 
    from neuromancer import dataset
 
-   train_loader, dev_loader, test_loader = dataset.gpphs_data_from_arrays(
+   train_loader, dev_loader, test_loader = dataset.get_gpphs_dataloaders(
        x=x_smooth,
        x_dot=xdot_smooth,
        u=u_i,
@@ -208,16 +223,6 @@ Usage
        split_ratio=[75.0, 15.0, 10.0],
        batch_size=N_POINTS,
    )
-
-Notes
-~~~~~
-
-``x_dot_var`` should always be passed when available.** It comes
-from ``gp_smooth`` and encodes point-wise uncertainty in the
-derivative estimates. Passing it allows the GP-PHS NLML to weight
-observations correctly. Omitting it falls back to a scalar noise
-assumption, which is less accurate in regions where the smoother is
-uncertain.
 
 **1D inputs are reshaped automatically.** If ``x``, ``x_dot``, ``u``,
 or ``x_dot_var`` are passed as ``(T,)`` arrays, they are reshaped to
@@ -232,8 +237,7 @@ PHSMatrices
 ``torch.nn.Module``
 
 ``PHSMatrices`` encodes the structural matrices of a Port-Hamiltonian
-System. It holds the user-defined sparsity pattern and functional
-dependence of **J** (skew-symmetric interconnection), **R** (diagonal
+System. **J** (skew-symmetric interconnection), **R** (diagonal
 dissipation), and **G** (input coupling).
 
 Constructor
@@ -303,13 +307,10 @@ lower triangle is filled at forward time as ``J[j, i] = -J[i, j]``.
 The diagonal is always zero.
 
 **Diagonal dissipation matrix R.** Your callables define the diagonal
-entries ``d``. R is assembled as ``diag(d)`` using
-``torch.diag_embed(d)``. No squaring, clamping, or transformation is
-applied internally. It is therefore the user's responsibility to
-ensure that all entries returned by ``R_diag`` are non-negative
-throughout the operating domain. ``get_R`` checks this on every
-forward call and raises ``ValueError`` if any negative entries are
-encountered.
+entries ``d``. Before assembling ``R = diag(d)``, each entry is clamped
+to be nonnegative using ``torch.clamp_min(0.0)``. This guarantees that
+the assembled dissipation matrix is positive semi-definite, although the
+underlying learnable parameters themselves may still become negative.
 
 **G is unconstrained.** No structural constraint is imposed.
 
@@ -363,15 +364,12 @@ Argument Shape           Description
 Output Shape               Constraint
 ====== =================== ==============
 ``J``  ``(batch, nx, nx)`` Skew-symmetric
-``R``  ``(batch, nx, nx)`` Diagonal
+``R``  ``(batch, nx, nx)`` Diagonal - positive semi-definite
 ``G``  ``(batch, nx, nu)`` Unconstrained
 ====== =================== ==============
 
 Validation and Warnings
 ~~~~~~~~~~~~~~~~~~~~~~~
-
-The constructor performs the following checks immediately on
-instantiation, before any forward pass:
 
 +-----------------------------------+-----------------------------------+
 | Check                             | Behavior                          |
@@ -490,7 +488,7 @@ PHSKernel
 
 ``PHSKernel`` is a structured, non-stationary GP kernel that encodes
 Port-Hamiltonian dynamics directly into the covariance function. It
-enforces the ``(J-R)\nabla H`` part of the PHS equation at the kernel
+enforces the ``(J-R)∇H`` part of the PHS equation at the kernel
 level by sandwiching the Hessian of a base RBF kernel between the
 ``(J-R)`` matrices evaluated at the input points:
 
@@ -607,7 +605,11 @@ _rbf_and_hessian(x1, x2)
        x2: Tensor
    ) -> Tuple[Tensor, Tensor]
 
-Internal method. You do not call this directly.
+**The Hessian is computed analytically.** There is no
+finite-difference or autograd approximation. The mixed partial
+``∂²k/∂xᵢ∂x'ⱼ`` is derived in closed form from the RBF kernel and
+computed fully vectorized over the batch, which keeps training
+efficient.
 
 Returns
 """""""
@@ -622,12 +624,6 @@ Returns
 |                       |                       | partial derivatives   |
 |                       |                       | ``∂²k/∂xᵢ∂x'ⱼ``       |
 +-----------------------+-----------------------+-----------------------+
-
-**The Hessian is computed analytically.** There is no
-finite-difference or autograd approximation. The mixed partial
-``∂²k/∂xᵢ∂x'ⱼ`` is derived in closed form from the RBF kernel and
-computed fully vectorized over the batch, which keeps training
-efficient.
 
 Numerical Stability
 ~~~~~~~~~~~~~~~~~~~
@@ -753,7 +749,7 @@ gradient ``(J-R)∇H``. Together they define a structured prior that
 constrains the GP to produce dynamics consistent with PHS theory.
 
 Why Not ``ExactGP``
-"""""""""""""""""""
+~~~~~~~~~~~~~~~~~~~
 
 GPyTorch's ``ExactGP`` assumes ``N`` scalar inputs map to ``N``
 scalar outputs. The PHS model has ``N`` state inputs mapping to
@@ -841,14 +837,6 @@ available through:
    gpphs_node.callable.gp_model              # GPPHSModel instance
    gpphs_node.callable.gp_model.covar_module # PHSKernel
    gpphs_node.callable.gp_model.mean_module  # PHSMeanFunction
-
-Notes
-~~~~~
-
-**Data is not stored.** Each forward call receives a fresh batch from
-the data loader. This keeps the model stateless with respect to data
-and avoids stale-cache issues that arise with GPyTorch's ``ExactGP``
-when training data changes between calls.
 
 .. _gpposterior:
 
@@ -943,7 +931,7 @@ Methods
 ~~~~~~~
 
 predict(smoothed, us, xdots, xdot_vars, test_x, n_samples)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code:: python
 
@@ -953,7 +941,7 @@ predict(smoothed, us, xdots, xdot_vars, test_x, n_samples)
        xdots:      List[np.ndarray],
        xdot_vars:  List[np.ndarray],
        test_x:     Tensor = None,
-       n_samples:  int = 50,
+       n_samples:  int = 20,
    ) -> Tuple[Tensor, Tensor, Tensor]
 
 The primary interface for computing the Hamiltonian posterior.
@@ -1031,7 +1019,7 @@ forward(train_x, train_u, train_xdot, test_x, n_samples, xdot_var)
        train_u:    Tensor,
        train_xdot: Tensor,
        test_x:     Tensor,
-       n_samples:  int = 10,
+       n_samples:  int = 20,
        xdot_var:   Tensor = None,
    ) -> Tuple[Tensor, Tensor, Tensor]
 
@@ -1065,58 +1053,6 @@ The computation proceeds as follows:
 
 The return signature is the same as ``predict``:
 ``(H_mean, H_var, H_samples)``.
-
-Internal Kernel Methods
-~~~~~~~~~~~~~~~~~~~~~~~
-
-These methods are used internally during the posterior computation.
-You do not call them directly.
-
-_k_HH(x1, x2)
-^^^^^^^^^^^^^
-
-Scalar RBF kernel between Hamiltonian values:
-
-::
-
-   k_HH(x, x') = σ²f · exp(-0.5 · ||x - x'||²_Λ)
-
-Returns
-"""""""
-
-Returns a tensor of shape ``(N, M)`` containing the covariance between
-Hamiltonian values evaluated at ``x1`` and ``x2``.
-
-_k_xdotH(x_train, x_test)
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Cross-kernel between state derivatives at training points and
-Hamiltonian values at test points. Derived analytically as:
-
-::
-
-   k_ẋH(x, x') = (J(x) - R(x)) · ∇_x k_HH(x, x')
-
-Returns
-"""""""
-
-Returns a tensor of shape ``(N·nx, M)``.
-
-_get_K_phs_plus_noise(x_train, u_train, xdot_var)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Returns
-"""""""
-
-Returns ``K_phs + Δ`` of shape ``(N·nx, N·nx)``.
-
-If ``xdot_var`` is provided, ``Δ`` is a diagonal matrix of
-per-observation derivative variances from the GP smoother.
-Otherwise,
-
-::
-
-   Δ = noise_var · I
 
 Usage
 ~~~~~
@@ -1451,7 +1387,7 @@ simultaneously.
 Notes
 ~~~~~
 
-**A small fixed jitter of ``1e-6`` is added to the diagonal** before
+**A small scaled jitter is added to the diagonal** before
 the Cholesky decomposition for floating-point stability. The PHS
 kernel is PSD by construction, so this does not affect the solution
 meaningfully.
@@ -1534,7 +1470,7 @@ Parameters
 | ``noise``             | ``float``             | Nugget added to the   |
 |                       |                       | GP diagonal for       |
 |                       |                       | numerical stability.  |
-|                       |                       | Default ``0.0``.     |
+|                       |                       | Default ``0.0``.      |
 +-----------------------+-----------------------+-----------------------+
 
 Methods
@@ -1570,40 +1506,6 @@ Returns
 
 Returns ``self`` so the method can be chained directly with the
 constructor.
-
-forward(x)
-^^^^^^^^^^
-
-.. code:: python
-
-   forward(x: Tensor) -> Tensor
-
-Evaluates ``H*(x)`` at query points.
-
-Returns
-"""""""
-
-Returns a tensor of Hamiltonian values of shape ``(K,)``.
-
-gradient(x)
-^^^^^^^^^^^
-
-.. code:: python
-
-   gradient(x: Tensor) -> Tensor
-
-Computes ``∇H*(x)`` at query points.
-
-For ``'gp'`` this is computed analytically from the squared
-exponential kernel derivative.
-
-For ``'spline'`` this uses autograd through a differentiable
-PyTorch reimplementation of the spline.
-
-Returns
-"""""""
-
-Returns the Hamiltonian gradient with shape ``(K, nx)``.
 
 Usage
 ~~~~~
@@ -1857,3 +1759,65 @@ simultaneously. The time-varying control input should then have shape
 **All integration runs inside ``torch.no_grad()``.** Gradients are
 not needed for trajectory simulation, and disabling them reduces
 memory usage significantly for large ensembles.
+
+Visualization
+~~~~~~~~~~~~~
+
+The ``neuromancer.psl.plot`` module provides convenience functions for
+visualizing the GP-PHS workflow and simulation results.
+
+**GP smoothing**
+
+Plots noisy and smoothed state trajectories together with the estimated
+state derivatives and their uncertainty.
+
+.. code:: python
+
+   plot.pltGPSmooth(
+       t_all,
+       trajs,
+       smoothed,
+       xdots,
+       xdot_vars,
+       x_trues=trajs_true,
+   )
+
+**Hamiltonian posterior**
+
+Plots the learned Hamiltonian posterior mean with ±2σ uncertainty bands
+and, optionally, the true Hamiltonian.
+
+.. code:: python
+
+   plot.pltHamiltonian(
+       H_mean.numpy(),
+       H_var.numpy(),
+       H_true=H_true_all,
+   )
+
+**Derivative prediction**
+
+Plots learned state derivatives against reference derivatives with
+optional uncertainty bands.
+
+.. code:: python
+
+   plot.pltXdot(
+       xdot_pred,
+       xdot_true,
+       xdot_std=xdot_pred_std,
+   )
+
+**Trajectory rollout**
+
+Plots simulated GP-PHS trajectories with optional uncertainty bands and
+reference trajectories.
+
+.. code:: python
+
+   plot.pltTrajectory(
+       t_gp,
+       mean,
+       std=std,
+       x_true=traj_true,
+   )
