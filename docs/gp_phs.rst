@@ -1760,6 +1760,8 @@ simultaneously. The time-varying control input should then have shape
 not needed for trajectory simulation, and disabling them reduces
 memory usage significantly for large ensembles.
 
+.. _visualization:
+
 Visualization
 ~~~~~~~~~~~~~
 
