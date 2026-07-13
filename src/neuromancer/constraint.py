@@ -351,6 +351,11 @@ class Variable(nn.Module):
         if isinstance(value, torch.Tensor) and value.requires_grad:
             value = nn.Parameter(value)
         self._value = value
+
+        # Optional transform applied when accessing the variable value
+        # (used to enforce parameter constraints such as positivity)
+        self._transform = None
+
         self._g, self.ordered_nodes = self.make_graph(input_variables)
 
         self._is_input = key is not None
@@ -608,7 +613,19 @@ class Variable(nn.Module):
 
     @property
     def value(self):
+        """
+        Returns the value of the variable, applying any transform if specified.
+        """
+        if self._transform is not None:
+            return self._transform(self._value)
         return self._value
+    
+    def set_transform(self, transform):
+        """
+        Register an optional differentiable transform applied whenever
+        the variable value is accessed.
+        """
+        self._transform = transform
 
     def minimize(self, metric=torch.mean, weight=1.0, name=None):
         return Objective(self, metric=metric, weight=weight, name=name)

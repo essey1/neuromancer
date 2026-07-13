@@ -19,6 +19,7 @@ Component 6 — GPPHSNode
 from __future__ import annotations
 
 import math
+from neuromancer.constraint import Variable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,6 +109,60 @@ def _extract_closure_parameters(fn) -> Dict[str, nn.Parameter]:
 
     return params
 
+# 
+def _extract_closure_variables(fn) -> Dict[str, Variable]:
+    vars = {}
+
+    if isinstance(fn, Variable):
+        return {"self": fn}
+
+    # closure
+    for i, cell in enumerate(getattr(fn, "__closure__", None) or []):
+        try:
+            val = cell.cell_contents
+        except ValueError:
+            continue
+
+        if isinstance(val, Variable):
+            vars[f"closure_{i}"] = val
+
+    # globals
+    try:
+        globs = getattr(fn, "__globals__", {})
+
+        for instr in dis.get_instructions(fn):
+            if instr.opname in ("LOAD_GLOBAL", "LOAD_NAME"):
+                name = instr.argval
+                val = globs.get(name)
+
+                if isinstance(val, Variable):
+                    vars[name] = val
+
+    except Exception:
+        pass
+
+    return vars
+
+def _depends_on_state(fn, nx):
+    probe = torch.randn(2, nx, requires_grad=True)
+
+    values = fn(probe)
+
+    try:
+        grad = torch.autograd.grad(
+            values.sum(),
+            probe,
+            allow_unused=True,
+        )[0]
+
+        return not (
+            grad is None
+            or torch.allclose(grad, torch.zeros_like(probe))
+        )
+
+    except RuntimeError:
+        return False
+
 # ---------------------------------------------------------------------------
 # Component 1 — PHSMatrices
 # ---------------------------------------------------------------------------
@@ -124,7 +179,7 @@ class PHSMatrices(nn.Module):
                       skew-symmetry enforced: J[j,i] = -J[i,j]
         R_diag      : diagonal entries of R
                       dict[i] -> callable(x) -> (batch,)
-                      PSD enforced: R = diag(d²)
+                      PSD enforced using softplus for non state dependent entries
         G_full      : full (nx, nu) entries of G
                       dict[(i,j)] -> callable(x) -> (batch,)
     """
@@ -142,6 +197,18 @@ class PHSMatrices(nn.Module):
         self._J_upper = J_upper
         self._R_diag  = R_diag
         self._G_full  = G_full
+
+        # check which R diagonal entries are constant (not state dependent)
+        self._is_state_dependent = {
+            i: _depends_on_state(fn, nx)
+            for i, fn in R_diag.items()
+        }
+
+        # Apply positivity transform to variables belonging to constant R entries
+        for i, fn in R_diag.items():
+            if not self._is_state_dependent[i]:
+                for var in _extract_closure_variables(fn).values():
+                    var.set_transform(F.softplus)
 
         # validate indices
         for (i, j) in J_upper:
@@ -203,8 +270,25 @@ class PHSMatrices(nn.Module):
         batch = x.shape[0]
         d = torch.zeros(batch, self.nx, dtype=x.dtype, device=x.device)
         for i, fn in self._R_diag.items():
-            d[:, i] = fn(x).clamp_min(0.0)
+            d[:, i] = fn(x)
+
         return torch.diag_embed(d)
+    
+    def validate_R(self, x: torch.Tensor):
+        """
+        Validate that state-dependent diagonal entries of R remain nonnegative
+        over the supplied states.
+        """
+        R = self.get_R(x)
+        diag = torch.diagonal(R, dim1=-2, dim2=-1)
+
+        for i, is_state_dependent in self._is_state_dependent.items():
+            if is_state_dependent:
+                if torch.any(diag[:, i] < 0):
+                    raise ValueError(
+                        f"State-dependent R[{i},{i}] became negative. "
+                        "Positive semidefiniteness cannot be guaranteed."
+                    )
 
     def get_G(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -733,6 +817,8 @@ class GPPHSNode(nn.Module):
         Returns:
             scalar NLML — stored under key ``'nlml'`` in the problem dict
         """
+        # Cache training states for post-training validation
+        self._last_X = X.detach()
         # On the first forward pass, initialize signal variance from the scale
         # of the observed derivatives. This prevents the optimizer from starting
         # in a near-zero basin where the GP ignores dynamics structure entirely.
@@ -763,3 +849,9 @@ class GPPHSNode(nn.Module):
             signal_var=self.gp_model.covar_module.signal_var.detach(),
             noise_var=self.likelihood.noise.detach(),
         )
+    def validate(self):
+        """
+        Validate Matrix R after training.
+        """
+        if hasattr(self, "_last_X"):
+            self.phs.validate_R(self._last_X)

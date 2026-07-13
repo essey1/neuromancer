@@ -303,6 +303,11 @@ class Trainer:
         # Assign best weights to the model
         self.model.load_state_dict(self.best_model)
 
+        # Validate models that expose a validation hook
+        for node in self.model.nodes:
+            if hasattr(node.callable, "validate"):
+                node.callable.validate()
+
         if self.logger is not None:
             self.logger.log_artifacts({
                 "best_model_state_dict.pth": self.best_model,
