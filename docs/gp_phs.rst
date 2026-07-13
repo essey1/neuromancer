@@ -15,6 +15,8 @@ Tutorials
 
 - `Double-well Oscillator <https://colab.research.google.com/drive/12w4pyQRXxjUhxb6bU5YVedYhlVAQrmWY?usp=sharing>`_
 - `Nonlinear Controlled 2-DOF Port-Hamiltonian Oscillator <https://colab.research.google.com/drive/1loRhSxpP5xddiRRP1DSQFKsQIq9SUUKO?usp=sharing>`_
+- `DC Motor with Elastic Load <https://colab.research.google.com/drive/11YDGDonR2qb0gganLuj29R1sgU3rQzKR?usp=sharing>`_
+- `Driven Duffing Oscillator, Chaotic Regime Stress Test <https://colab.research.google.com/drive/1P3B6fqqZ1TR20O-o3Cz5lUgFay-ffPL6?usp=sharing>`_
 
 .. contents:: Table of Contents
    :local:
@@ -303,23 +305,39 @@ Structural Constraints
 
 **Skew-symmetry of J.** You only define the strictly upper triangle
 (``i < j``). The constructor rejects any key that violates this. The
-lower triangle is filled at forward time as ``J[j, i] = -J[i, j]``.
+lower triangle is filled at evaluation time as ``J[j, i] = -J[i, j]``.
 The diagonal is always zero.
 
-**Diagonal dissipation matrix R.** Your callables define the diagonal
-entries ``d``. Before assembling ``R = diag(d)``, each entry is clamped
-to be nonnegative using ``torch.clamp_min(0.0)``. This guarantees that
-the assembled dissipation matrix is positive semi-definite, although the
-underlying learnable parameters themselves may still become negative.
+**Diagonal dissipation matrix R.** Each diagonal entry is supplied as a
+callable ``f(x) -> Tensor``. During construction, GP-PHS automatically
+detects whether each callable is constant or state dependent using
+automatic differentiation.
+
+- **Constant entries** are automatically assigned a differentiable
+  positivity transform (implemented using the softplus function), guaranteeing that the corresponding diagonal
+  entry remains nonnegative throughout optimization.
+
+- **State-dependent entries** are evaluated exactly as provided. Since
+  positive semi-definiteness cannot, in general, be guaranteed for an
+  arbitrary state-dependent function, these entries are validated after
+  training.
 
 **G is unconstrained.** No structural constraint is imposed.
 
-**Note:** Any entry not specified is treated as zero.
+**Note:** Any unspecified entry is assumed to be zero.
 
 Parameter Auto-Detection
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-Detection works for:
+GP-PHS automatically detects whether each diagonal entry of ``R`` is
+constant or state dependent by checking whether the supplied callable
+depends on the state variable ``x`` using PyTorch automatic
+differentiation.
+
+For constant entries, positivity is enforced automatically through the
+associated learnable parameter.
+
+Detection supports:
 
 - Parameters captured through Python closures
 - Parameters stored inside ``nn.Module`` objects
@@ -338,6 +356,9 @@ For example:
    R_diag = {
        1: lambda x: b.value * torch.ones(x.shape[0])
    }
+
+The callable above is detected as constant, since it does not depend on
+the values of ``x``.
 
 Methods
 ~~~~~~~
@@ -364,28 +385,32 @@ Argument Shape           Description
 Output Shape               Constraint
 ====== =================== ==============
 ``J``  ``(batch, nx, nx)`` Skew-symmetric
-``R``  ``(batch, nx, nx)`` Diagonal - positive semi-definite
+``R``  ``(batch, nx, nx)`` Diagonal (PSD guaranteed for constant entries)
 ``G``  ``(batch, nx, nu)`` Unconstrained
 ====== =================== ==============
 
 Validation and Warnings
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-+-----------------------------------+-----------------------------------+
-| Check                             | Behavior                          |
-+===================================+===================================+
-| ``J_upper`` key ``(i,j)`` has     | Raises ``ValueError``             |
-| ``i >= j`` or is out of range     |                                   |
-+-----------------------------------+-----------------------------------+
-| ``R_diag`` key ``i`` is out of    | Raises ``ValueError``             |
-| ``[0, nx)``                       |                                   |
-+-----------------------------------+-----------------------------------+
-| ``G_full`` key ``(i,j)`` is out   | Raises ``ValueError``             |
-| of range                          |                                   |
-+-----------------------------------+-----------------------------------+
-| ``R_diag`` is missing one or more | Issues ``UserWarning`` (R will be |
-| diagonal indices                  | degenerate)                       |
-+-----------------------------------+-----------------------------------+
++-----------------------------------+-----------------------------------------------+
+| Check                             | Behavior                                      |
++===================================+===============================================+
+| ``J_upper`` key ``(i,j)`` has     | Raises ``ValueError``                         |
+| ``i >= j`` or is out of range     |                                               |
++-----------------------------------+-----------------------------------------------+
+| ``R_diag`` key ``i`` is out of    | Raises ``ValueError``                         |
+| ``[0, nx)``                       |                                               |
++-----------------------------------+-----------------------------------------------+
+| ``G_full`` key ``(i,j)`` is out   | Raises ``ValueError``                         |
+| of range                          |                                               |
++-----------------------------------+-----------------------------------------------+
+| ``R_diag`` is missing one or more | Issues ``UserWarning`` (R will be             |
+| diagonal indices                  | degenerate)                                   |
++-----------------------------------+-----------------------------------------------+
+| State-dependent diagonal entry of | Raises ``ValueError`` after training if any   |
+| ``R`` becomes negative            | sampled state produces a negative diagonal    |
+|                                   | entry.                                        |
++-----------------------------------+-----------------------------------------------+
 
 Usage Example
 ~~~~~~~~~~~~~
