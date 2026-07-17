@@ -17,6 +17,7 @@ Tutorials
 - `Nonlinear Controlled 2-DOF Port-Hamiltonian Oscillator <https://colab.research.google.com/drive/1loRhSxpP5xddiRRP1DSQFKsQIq9SUUKO?usp=sharing>`_
 - `DC Motor with Elastic Load <https://colab.research.google.com/drive/11YDGDonR2qb0gganLuj29R1sgU3rQzKR?usp=sharing>`_
 - `Driven Duffing Oscillator, Chaotic Regime Stress Test <https://colab.research.google.com/drive/1P3B6fqqZ1TR20O-o3Cz5lUgFay-ffPL6?usp=sharing>`_
+- `Inverted Pendulum on a Cart, Non-Separable Hamiltonian <https://colab.research.google.com/drive/1steRRNY7nYC4MDEan3fhtZoxyfWUJYD7?usp=sharing>`_
 
 .. contents:: Table of Contents
    :local:
